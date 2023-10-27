@@ -1,0 +1,414 @@
+trigger: none
+schedules:
+  - cron: "0 2 * * *"
+    displayName: "2am"
+    branches:
+      include:
+        - main
+    always: true
+variables:
+  - name: BACKUP_FOLDER
+    value: prod-backup
+  - name: PIPELINE_TIME_LIMIT
+    value: "60" # 60 is default for free Pipeline, 0 for unlimited run time
+  - name: TENANT_NAME
+    value: contoso.onmicrosoft.com
+  - name: USER_EMAIL
+    value: IT_Azure_Backupper@contoso.com
+  - name: USER_NAME
+    value: IT_Azure_Backupper
+  # CLIENT_ID (Id of the SP that whould be used for authentication) and CLIENT_SECRET needs to be set separately using pipeline variables setting (so the secret is not saved as plaintext)
+
+jobs:
+  - job: backup_azure
+    displayName: Backup & commit Azure configuration
+    pool:
+      vmImage: windows-latest
+    continueOnError: false
+    steps:
+      - checkout: self
+        persistCredentials: true
+
+      - task: PowerShell@2
+        displayName: Export backup & commit
+        name: commitAndSetVariable
+        inputs:
+          targetType: "inline"
+          script: |
+            $root = "$(Build.SourcesDirectory)"
+
+            Set-Location $root
+
+            # $verbosePreference = 'continue'
+
+            Write-Host 'Installing EntraExporter module'
+            Install-Module -Name EntraExporter -AllowClobber -Force -AcceptLicense
+
+            #region authenticate to Graph API using service principal secret
+            $applicationId = "$(CLIENT_ID)"
+            $securedPassword = "$(CLIENT_SECRET)"
+            $tenantID = "$(TENANT_NAME)"
+
+            $securedPasswordPassword = ConvertTo-SecureString -String $SecuredPassword -AsPlainText -Force
+            $clientSecretCredential = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $ApplicationId, $SecuredPasswordPassword
+            Write-Host "Authenticating to Graph API"
+            Connect-MgGraph -TenantId $tenantID -ClientSecretCredential $ClientSecretCredential -NoWelcome
+            #endregion authenticate to Graph API using service principal secret
+
+            # configure GIT defaults
+            git config --global user.name 'unknown'
+            git config --global user.email 'unknown@unknown.com'
+            # to avoid 256 limit on Windows
+            git config --global core.longpaths true
+            # to support UNICODE
+            git config --global core.quotepath off
+            # to avoid 'CRLF will be replaced by LF the next time Git touches it'
+            git config --global core.eol lf
+            git config --global core.autocrlf false
+
+            Write-Host 'Removing existing backup directory'
+            Remove-Item "$root\$(BACKUP_FOLDER)" -Force -Recurse -ErrorAction silentlycontinue
+
+            Write-Host "`n$(Get-Date -format 'HH:mm') (UTC) Creating Azure config backup"
+            $backupStart = Get-Date
+            # set BACKUP_START pipeline variable
+            echo "##vso[task.setVariable variable=BACKUP_START]$backupStart"
+            Export-Entra "$root\$(BACKUP_FOLDER)" -All -CloudUsersAndGroupsOnly
+
+            $untrackedFile = git ls-files --others --exclude-standard --full-name
+            $trackedFile = git ls-files --modified --full-name
+            $changedFile = $untrackedFile, $trackedFile | % { $_ } | ? { $_ }
+
+            if ($changedFile) {
+              # set CHANGE_DETECTED pipeline variable
+              echo "##vso[task.setVariable variable=CHANGE_DETECTED;isOutput=true;]1"
+
+              # install required Graph module (for getting audit logs)
+              Write-Host 'Installing Microsoft.Graph.Reports module'
+              Install-Module Microsoft.Graph.Reports -AllowClobber -Force -AcceptLicense
+
+              #region helper functions
+              # to be able to catch errors and all outputs
+              function _startProcess {
+                [CmdletBinding()]
+                param (
+                  [string] $filePath = ''
+                  ,
+                  [string] $argumentList = ''
+                  ,
+                  [string] $workingDirectory = (Get-Location)
+                  ,
+                  [switch] $dontWait
+                  ,
+                  # lot of git commands output verbose output to error stream
+                  [switch] $outputErr2Std
+                )
+
+                $p = New-Object System.Diagnostics.Process
+                $p.StartInfo.UseShellExecute = $false
+                $p.StartInfo.RedirectStandardOutput = $true
+                $p.StartInfo.RedirectStandardError = $true
+                $p.StartInfo.WorkingDirectory = $workingDirectory
+                $p.StartInfo.FileName = $filePath
+                $p.StartInfo.Arguments = $argumentList
+                [void]$p.Start()
+                if (!$dontWait) {
+                  $p.WaitForExit()
+                }
+
+                $result = $p.StandardOutput.ReadToEnd()
+                if ($result) {
+                  # to avoid returning of null
+                  $result
+                }
+                if ($outputErr2Std) {
+                    $p.StandardError.ReadToEnd()
+                } else {
+                  if ($err = $p.StandardError.ReadToEnd()) {
+                      Write-Error $err
+                  }
+                }
+              }
+
+              # decides whether there is enough time to search for change author, before pipeline terminates
+              function _enoughTime {
+                if (!($(PIPELINE_TIME_LIMIT))) {
+                  return $true
+                }
+
+                $insurance = 2
+                $remainingFile = @($changedFile).count - $processedFile
+                $runMinute = ([datetime]::Now - $backupStart).TotalMinutes
+                # I hope 0.2 second is enough for one change processing
+                # TIP: make it higher if it is not
+                $remainingMinute = ($remainingFile * 0.2)/60
+                if (($runMinute + $remainingMinute + $insurance) -lt $(PIPELINE_TIME_LIMIT)) {
+                  return $true
+                } else {
+                  return $false
+                }
+              }
+              #endregion helper functions
+
+              # get date of the last config backup commit, to have the starting point for searching the audit log
+              # because of shallow clones, I need to fetch more data before calling git log
+              $gitCommitDepth = 30
+              _startProcess git "fetch --depth=$gitCommitDepth" -outputErr2Std -dontWait
+              $commitList = _startProcess git "--no-pager log --no-show-signature -$gitCommitDepth --format=%s%%%%%%%cI" -outputErr2Std -dontWait
+              $lastCommitDate = $commitList -split "`n" | ? {$_} | % {
+                $commitName, $commitDate = $_ -split "%%%"
+                if ($commitName -match "^\d{4}\.\d{2}\.\d{2}_\d{2}\.\d{2} -- ") {
+                  # config backup commit name is in a format '2023.10.08_01.01 -- ...'
+                  $commitDate
+                }
+              }
+              if ($lastCommitDate) {
+                # pick the newest and convert it to datetime object
+                $lastCommitDate = Get-Date @($lastCommitDate)[0]
+              } else {
+                # this is the first config backup (there will be thousands of changes) and Azure Audit log can contain A LOT of events past 30 days
+                if ($(PIPELINE_TIME_LIMIT)) {
+                  # because of the Pipeline run time limit, limit the number of searched events
+                  Write-Warning "Unable to obtain date of the last backup config commit. Azure audit events from last 24 hours will be gathered."
+                  $lastCommitDate = $backupStart.AddDays(-1)
+                } else {
+                  # no limit required
+                  Write-Warning "Unable to obtain date of the last backup config commit. ALL Azure audit events will be gathered."
+                }
+              }
+
+              # array where objects representing each changed file will be saved with information like who made the change etc
+              $modificationData = New-Object System.Collections.ArrayList
+
+              #region get all Azure audit events since the last commit
+              # it is much faster to get all events at once then retrieve them one by one using resourceId
+              #region create search filter
+              $filter = @("Result eq 'success'")
+
+              if ($lastCommitDate) {
+                # Azure logs use UTC time
+                $lastCommitDate = $lastCommitDate.ToUniversalTime()
+                $filterDateTimeFrom = Get-Date -Date $lastCommitDate -Format "yyyy-MM-ddTHH:mm:ss"
+                $filter += "ActivityDateTime ge $filterDateTimeFrom`Z"
+              }
+
+              $backupStart = $backupStart.ToUniversalTime()
+              $filterDateTimeTo = Get-Date -Date $backupStart -Format "yyyy-MM-ddTHH:mm:ss"
+              $filter += "ActivityDateTime le $filterDateTimeTo`Z"
+
+              $eventFilter = $filter -join " and "
+              #endregion create search filter
+
+              Write-Host "`n$(Get-Date -format 'HH:mm') (UTC) Getting Azure Audit events"
+              Write-Host "`t- from: '$lastCommitDate' (UTC) to: '$backupStart' (UTC)"
+              Write-Host "`t- filter: $eventFilter"
+              $modificationEvent = Get-MgAuditLogDirectoryAudit -All -Filter $eventFilter
+              # omit events not related to making changes
+              $modificationEvent = $modificationEvent.Where({$_.OperationType})
+              Write-Host "`t- found $($modificationEvent.count) events"
+              #endregion get all Azure audit events since the last commit
+
+              Write-Host "`n$(Get-Date -format 'HH:mm') (UTC) Processing changed files ($($changedFile.count))"
+              $processedFile = 0
+              $skippedSearching = 0
+              # try to find out who made the change
+              foreach ($file in $changedFile) {
+                ++$processedFile
+                # resource ID is same as a file name
+                $resourceId = [System.IO.Path]::GetFileNameWithoutExtension($file)
+                Write-Verbose "`t- $resourceId ($file)"
+
+                #region get author of the resource change
+                # users, SP etc are used at several places (owner, member,...) so use already processed results if possible
+                $cachedData = $modificationData.Where({$_.resourceId -eq $resourceId})
+                if ($cachedData) {
+                  $modificationAuthorUPN = @($cachedData.modificationAuthorUPN)[0]
+                  Write-Verbose "`t`t- using cached data, changed by: $($modificationAuthorUPN -join ', ')"
+                } else {
+                  if (_enoughTime) {
+                    # search for change author only in situation there is enough time to complete whole pipeline (because of 60 minute limit)
+                    $resourceModificationEvent = $modificationEvent.Where({$_.TargetResources.Id -eq $resourceId})
+
+                    # list of change actors
+                    $modificationAuthorUPN = @()
+
+                    $resourceModificationEvent.InitiatedBy | % {
+                      $actor = $_
+
+                      if ($actor.User.UserPrincipalName) {
+                        # modified by user
+                        $modificationAuthorUPN += $actor.User.UserPrincipalName
+                      } elseif ($actor.App.DisplayName) {
+                        # modified by service principal
+                        $modificationAuthorUPN += ($actor.App.DisplayName + " (SP)")
+                      }
+                    }
+
+                    $modificationAuthorUPN = $modificationAuthorUPN | select -Unique | Sort-Object
+                  } else {
+                    # give up searching for change author because of pipeline run 60 minutes limit
+                    ++$skippedSearching
+                    $modificationAuthorUPN = $null
+                  }
+
+                  if ($modificationAuthorUPN) {
+                    Write-Verbose "`t`t- changed by: $($modificationAuthorUPN -join ', ')"
+                  } else {
+                    # first run or change was probably made a few minutes before backup was initiated therefore event isn't logged in the Audit log yet
+                    Write-Verbose "`t`t- unable to find out who made the change"
+                    $modificationAuthorUPN = 'unknown@unknown.com'
+                  }
+                }
+                #endregion get author of the resource change
+
+                $null = $modificationData.Add(
+                  [PSCustomObject]@{
+                      resourceId            = $resourceId
+                      file                  = Join-Path $root $file
+                      modificationAuthorUPN = $modificationAuthorUPN
+                  }
+                )
+              }
+
+              if ($skippedSearching) {
+                Write-Warning "Skipped searching for change author in $skippedSearching cases (because of the $(PIPELINE_TIME_LIMIT) minutes pipeline run limit)"
+              }
+
+              #region commit changes by author(s) who made them
+              Write-Host "`n$(Get-Date -format 'HH:mm') (UTC) Committing changes"
+              # tip: grouping by created string, otherwise doesn't work correctly (probably because modificationAuthorUPN can contains multiple values)!
+              $modificationData | Group-Object { $_.modificationAuthorUPN -join '&'} | % {
+                $modificationAuthorUPN = $_.Group.ModificationAuthorUPN | Select-Object -Unique
+                $modificationAuthorName = $modificationAuthorUPN | % { $_.split('@')[0] }
+                $modifiedFile = $_.Group.File
+
+                $modifiedFile | % {
+                  Write-Verbose "`t- Adding $_"
+                  $gitResult = _startProcess git -ArgumentList "add `"$_`"" -dontWait -outputErr2Std
+                  if ($gitResult -match "^fatal:") {
+                    throw $gitResult
+                  }
+                }
+
+                Write-Host "`t- Setting commit author(s): $($modificationAuthorName -join ', ')"
+                git config user.name ($modificationAuthorName -join ', ')
+                git config user.email ($modificationAuthorUPN -join ', ')
+
+                # in case of any change in commit name, you have to modify retrieval of the $lastCommitDate too!!!
+                $DATEF = "$(Get-Date $backupStart -f yyyy.MM.dd_HH.mm)"
+                $commitName = "$DATEF` -- $($modificationAuthorName -join ', ')"
+
+                Write-Host "`t- Creating commit '$commitName'"
+                $null = _startProcess git -ArgumentList "commit -m `"$commitName`"" -dontWait
+
+                $unpushedCommit = _startProcess git -ArgumentList "cherry -v origin/main"
+                if ([string]::IsNullOrEmpty($unpushedCommit)) {
+                  # no change detected
+                  # this shouldn't happen, it means that detection of the changed files isn't working correctly
+                  Write-Warning "Nothing to commit?! This shouldn't happen."
+                  # set CHANGE_DETECTED pipeline variable
+                  echo "##vso[task.setVariable variable=CHANGE_DETECTED;isOutput=true;]0"
+                } else {
+                  Write-Host "`t`t- Commit was created"
+                  # save commit date to pipeline variable to use it when creating TAG
+                  echo "##vso[task.setVariable variable=COMMIT_DATE;isOutput=true;]$DATEF"
+                  # save modification author(s) to use when creating TAG
+                  echo "##vso[task.setVariable variable=MODIFICATION_AUTHOR;isOutput=true;]$(($modificationData.modificationAuthorUPN | select -Unique | Sort-Object) -join ', ')"
+                }
+              }
+              #endregion commit changes by author(s) who made them
+
+              Write-Host "`nPushing changes to upstream"
+              $result = _startProcess git -argumentList "push origin HEAD:main" -dontWait -outputErr2Std
+            } else {
+              Write-Host "No change detected"
+              # set CHANGE_DETECTED pipeline variable
+              echo "##vso[task.setVariable variable=CHANGE_DETECTED;isOutput=true;]0"
+            }
+          failOnStderr: true
+          pwsh: false
+
+  - job: tag
+    displayName: Tag repo
+    dependsOn: backup_azure
+    condition: and(succeeded(), eq(dependencies.backup_azure.outputs['commitAndSetVariable.CHANGE_DETECTED'], 1))
+    pool:
+      vmImage: windows-latest
+    continueOnError: false
+    variables:
+      COMMIT_DATE: $[ dependencies.backup_azure.outputs['commitAndSetVariable.COMMIT_DATE'] ]
+      MODIFICATION_AUTHOR: $[ dependencies.backup_azure.outputs['commitAndSetVariable.MODIFICATION_AUTHOR'] ]
+    steps:
+      - checkout: self
+        persistCredentials: true
+      - task: PowerShell@2
+        displayName: Git tag
+        inputs:
+          targetType: "inline"
+          script: |
+            # change in configuration backup folder detected, create TAG
+
+            #region helper functions
+            # to be able to catch errors and all outputs
+            function _startProcess {
+              [CmdletBinding()]
+              param (
+                [string] $filePath = ''
+                ,
+                [string] $argumentList = ''
+                ,
+                [string] $workingDirectory = (Get-Location)
+                ,
+                [switch] $dontWait
+                ,
+                # lot of git commands output verbose output to error stream
+                [switch] $outputErr2Std
+              )
+
+              $p = New-Object System.Diagnostics.Process
+              $p.StartInfo.UseShellExecute = $false
+              $p.StartInfo.RedirectStandardOutput = $true
+              $p.StartInfo.RedirectStandardError = $true
+              $p.StartInfo.WorkingDirectory = $workingDirectory
+              $p.StartInfo.FileName = $filePath
+              $p.StartInfo.Arguments = $argumentList
+              [void]$p.Start()
+              if (!$dontWait) {
+                $p.WaitForExit()
+              }
+
+              $result = $p.StandardOutput.ReadToEnd()
+              if ($result) {
+                # to avoid returning of null
+                $result
+              }
+              if ($outputErr2Std) {
+                  $p.StandardError.ReadToEnd()
+              } else {
+                if ($err = $p.StandardError.ReadToEnd()) {
+                    Write-Error $err
+                }
+              }
+            }
+            #endregion helper functions
+
+            # configure Git
+            git config --global user.name $(USER_NAME)
+            git config --global user.email $(USER_EMAIL)
+            git config --global core.longpaths true
+
+            # pull origin
+            $gitResult = _startProcess git "pull origin main" -outputErr2Std -dontWait
+            if ($gitResult -match "^fatal:") {
+              throw $gitResult
+            }
+
+            $DATEF= "$(COMMIT_DATE)"
+            Write-Host "Creating TAG '$DATEF'"
+            git tag -a "$DATEF" -m "$DATEF -- Azure configuration snapshot (changes made by: $(MODIFICATION_AUTHOR))"
+            $gitResult = _startProcess git "push origin HEAD:main `"$DATEF`"" -outputErr2Std -dontWait
+            if ($gitResult -match "^fatal:") {
+              throw $gitResult
+            }
+          failOnStderr: true
+          workingDirectory: "$(Build.SourcesDirectory)"
