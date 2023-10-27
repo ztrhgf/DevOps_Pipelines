@@ -379,8 +379,7 @@ jobs:
       #             --path="$(Build.SourcesDirectory)/prod-backup" \
       #             --outpath="$(Build.SourcesDirectory)/prod-as-built.md" \
       #             --tenantname=$TENANT_NAME \
-      #             --intro="$INTRO" \
-      #             #--split=Y
+      #             --intro="$INTRO"
 
       #         # Commit changes and push to repo
       #         DATEF=`date +%Y.%m.%d`
@@ -444,7 +443,7 @@ jobs:
           failOnStderr: true
           pwsh: false
           workingDirectory: "$(Build.SourcesDirectory)"
-
+  # Publish PDF & HTML documents as an artifacts
   # - job: publish
   #   displayName: Publish as-built artifacts
   #   dependsOn: tag
