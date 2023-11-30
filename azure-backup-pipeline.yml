@@ -85,7 +85,7 @@ jobs:
 
               # install required Graph module (for getting audit logs)
               Write-Host 'Installing Microsoft.Graph.Reports module'
-              Install-Module Microsoft.Graph.Reports -AllowClobber -Force -AcceptLicense
+              Install-Module Microsoft.Graph.Reports -AllowClobber -Force -AcceptLicense -RequiredVersion 2.8.0 # 2.10.0 is buggy (Get-MgAuditLogDirectoryAudit : One or more errors occurred.)
 
               #region helper functions
               # to be able to catch errors and all outputs
