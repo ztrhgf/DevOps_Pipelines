@@ -61,7 +61,7 @@ jobs:
                 --mode=1 \
                 --output=json \
                 --path="$(Build.SourcesDirectory)/$(BACKUP_FOLDER)" \
-                --exclude CompliancePartner \
+                --exclude CompliancePartner VPPusedLicenseCount\
                 --append-id
           workingDirectory: "$(Build.SourcesDirectory)"
           failOnStderr: true
