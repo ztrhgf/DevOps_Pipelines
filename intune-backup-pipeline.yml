@@ -387,6 +387,7 @@ jobs:
       #         git config user.email $(USER_EMAIL)
       #         git add --all
       #         git commit -m "Intune config as-built $DATEF"
+      #         git pull origin main
       #         git push origin HEAD:main
       #       else
       #         echo "no configuration backup change detected in the last commit, documentation will not be created"
