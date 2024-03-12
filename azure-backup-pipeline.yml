@@ -301,7 +301,7 @@ jobs:
                 Write-Host "`t- Creating commit '$commitName'"
                 $null = _startProcess git -ArgumentList "commit -m `"$commitName`"" -dontWait
 
-                $unpushedCommit = _startProcess git -ArgumentList "cherry -v origin/main"
+                $unpushedCommit = _startProcess git -ArgumentList "cherry -v origin/main" -dontWait
                 if ([string]::IsNullOrEmpty($unpushedCommit)) {
                   # no change detected
                   # this shouldn't happen, it means that detection of the changed files isn't working correctly
