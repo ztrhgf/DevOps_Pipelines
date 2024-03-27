@@ -1,0 +1,504 @@
+trigger: none
+schedules:
+  - cron: "0 1 * * *"
+    displayName: "1am every day"
+    branches:
+      include:
+        - main
+    always: true
+variables:
+  - name: BACKUP_FOLDER
+    value: prod-backup
+  - name: TENANT_NAME
+    value: contoso.onmicrosoft.com
+  - name: SERVICE_CONNECTION_NAME
+    value: intune_backup_connection
+  - name: USER_EMAIL
+    value: IT_Intune_Backupper@contoso.com
+  - name: USER_NAME
+    value: IT_Intune_Backupper
+
+jobs:
+  - job: backup_intune
+    displayName: Backup & commit Intune configuration
+    pool:
+      vmImage: ubuntu-latest
+    continueOnError: false
+    steps:
+      - checkout: self
+        persistCredentials: true
+
+      - task: Bash@3
+        displayName: Remove existing prod-backup directory
+        inputs:
+          targetType: "inline"
+          script: |
+            rm -rfv "$(Build.SourcesDirectory)/$(BACKUP_FOLDER)"
+          workingDirectory: "$(Build.SourcesDirectory)"
+          failOnStderr: false
+
+      - task: Bash@3
+        displayName: Install IntuneCD
+        inputs:
+          targetType: "inline"
+          script: |
+            pip3 install IntuneCD
+          workingDirectory: "$(Build.SourcesDirectory)"
+          failOnStderr: true
+
+      - task: AzurePowerShell@5
+        displayName: "Get Graph Token for Workload Federated Credential"
+        inputs:
+          azureSubscription: $(SERVICE_CONNECTION_NAME)
+          azurePowerShellVersion: "LatestVersion"
+          ScriptType: "inlineScript"
+          Inline: |
+            $accessToken = (Get-AzAccessToken -ResourceTypeName MSGraph -ErrorAction Stop).Token
+            Write-Host "##vso[task.setvariable variable=accessToken;issecret=true]$accessToken"
+
+      # Backup the latest configuration, using the current directory
+      - task: Bash@3
+        displayName: Create Intune backup
+        inputs:
+          targetType: "inline"
+          script: |
+            mkdir -p "$(Build.SourcesDirectory)/$(BACKUP_FOLDER)"
+
+            BACKUP_START=`date +%Y.%m.%d:%H.%M.%S`
+            # set BACKUP_START pipeline variable
+            echo "##vso[task.setVariable variable=BACKUP_START]$BACKUP_START"
+
+            IntuneCD-startbackup \
+                -t $(accessToken) \
+                --mode=1 \
+                --output=json \
+                --path="$(Build.SourcesDirectory)/$(BACKUP_FOLDER)" \
+                --exclude CompliancePartnerHeartbeat ManagedGooglePlay VPPusedLicenseCount\
+                --append-id \
+                --ignore-omasettings
+          workingDirectory: "$(Build.SourcesDirectory)"
+          failOnStderr: true
+
+      # Commit changes and push to repo
+      - task: PowerShell@2
+        displayName: Find change author & commit the backup
+        name: commitAndSetVariable
+        inputs:
+          targetType: "inline"
+          script: |
+            # $verbosePreference = 'continue'
+
+            $root = "$(Build.SourcesDirectory)"
+
+            Set-Location $root
+
+            # configure GIT defaults
+            git config --global user.name 'unknown'
+            git config --global user.email 'unknown@unknown.com'
+            # to avoid 256 limit on Windows
+            git config --global core.longpaths true
+            # to support UNICODE
+            git config --global core.quotepath off
+            # to avoid 'CRLF will be replaced by LF the next time Git touches it'
+            git config --global core.eol lf
+            git config --global core.autocrlf false
+
+            # get changed config files
+            $untrackedFile = git ls-files --others --exclude-standard --full-name
+            $trackedFile = git ls-files --modified --full-name
+            $changedFile = $untrackedFile, $trackedFile | % { $_ } | ? { $_ }
+
+            # "status"
+            # git --no-pager status
+
+            # "diff"
+            # git --no-pager diff
+
+            if ($changedFile) {
+                # set CHANGE_DETECTED pipeline variable
+                echo "##vso[task.setVariable variable=CHANGE_DETECTED;isOutput=true;]1"
+
+                # install required Graph modules (for authentication and getting audit logs)
+                if (!(Get-Module "Microsoft.Graph.DeviceManagement.Administration" -ListAvailable)) {
+                  Install-Module Microsoft.Graph.DeviceManagement.Administration -AllowClobber -Force -AcceptLicense
+                }
+
+                #region authenticate to Graph API using service principal secret
+                Write-Host "Authenticating to Graph API"
+                $secureToken = ConvertTo-SecureString -String $(accessToken) -AsPlainText -Force
+                Connect-MgGraph -AccessToken $secureToken -NoWelcome
+                #endregion authenticate to Graph API using service principal secret
+
+                #region helper functions
+                # function to be able to catch errors and all outputs
+                function _startProcess {
+                    [CmdletBinding()]
+                    param (
+                        [string] $filePath = ''
+                        ,
+                        [string] $argumentList = ''
+                        ,
+                        [string] $workingDirectory = (Get-Location)
+                        ,
+                        [switch] $dontWait
+                        ,
+                        # lot of git commands output verbose output to error stream
+                        [switch] $outputErr2Std
+                    )
+
+                    $p = New-Object System.Diagnostics.Process
+                    $p.StartInfo.UseShellExecute = $false
+                    $p.StartInfo.RedirectStandardOutput = $true
+                    $p.StartInfo.RedirectStandardError = $true
+                    $p.StartInfo.WorkingDirectory = $workingDirectory
+                    $p.StartInfo.FileName = $filePath
+                    $p.StartInfo.Arguments = $argumentList
+                    [void]$p.Start()
+                    if (!$dontWait) {
+                        $p.WaitForExit()
+                    }
+
+                    $result = $p.StandardOutput.ReadToEnd()
+                    if ($result) {
+                        # to avoid returning of null
+                        $result
+                    }
+                    if ($outputErr2Std) {
+                        $p.StandardError.ReadToEnd()
+                    } else {
+                        if ($err = $p.StandardError.ReadToEnd()) {
+                            Write-Error $err
+                        }
+                    }
+                }
+
+                function _getResourceId {
+                  [CmdletBinding()]
+                  param (
+                    [string] $filePath
+                  )
+
+                  $fileName = [System.IO.Path]::GetFileNameWithoutExtension($filePath)
+
+                  # some files are just additional content for an existing config JSON and IntuneCD author decided to not put ResourceId in their name (a.k.a. resourceId needs to be retrieved from the "parent" file name)
+                  # some files just don't have ResourceId in their name because of the IntunceCD author decision
+                  if ($filePath -like "*Device Configurations/mobileconfig/*") {
+                    $parentFolderPath = Split-Path (Split-Path $filePath -Parent) -Parent
+                    $fileName = Get-ChildItem $parentFolderPath -File | ? {
+                      (ConvertFrom-Json -InputObject (Get-Content $_.FullName -Raw)).payloadFileName -eq [System.IO.Path]::GetFileName($filePath)
+                      } | select -expand BaseName
+                    if (!$fileName) {
+                      #FIXME throw az budu umet vytahnout parent file i pri DELETE operaci
+                      Write-Warning "Unable to find 'parent' config file for $filePath"
+                      return
+                    }
+                  } elseif ($filePath -like "*/Managed Google Play/*") {
+                    return ($modificationEvent | ? { $_.Category -eq 'Enrollment' -and $_.ActivityType -eq "Patch AndroidForWorkSettings" }).Resources.ResourceId
+                  }
+
+                  # parse resource ID from the file name
+                  # file name is in format <policyname>__<ID>
+                  # beware that it doesn't have to be GUID! For example ESP profile, Apple configurator profile etc uses as ID <guid>_guid>, <guid>_string
+                  $delimiter = "__"
+                  if ($fileName -like "*$delimiter*") {
+                    $resourceId = ($fileName -split $delimiter)[-1]
+                    # just in case file name contains more than two following underscores in a row which would lead to ID starting with underscore(s)
+                    $resourceId = $resourceId -replace "^_*"
+                  } else {
+                    $resourceId = $null
+                  }
+
+                  return $resourceId
+                }
+                #endregion helper functions
+
+                # get date of the last config backup commit, to have the starting point for searching the audit log
+                # because of shallow clones, I need to fetch more data before calling git log
+                $gitCommitDepth = 30
+                git fetch --depth=$gitCommitDepth
+                $commitList = _startProcess git "--no-pager log --no-show-signature -$gitCommitDepth --format=%s%%%%%%%cI" -outputErr2Std -dontWait
+                $lastCommitDate = $commitList -split "`n" | ? {$_} | % {
+                  $commitName, $commitDate = $_ -split "%%%"
+                  if ($commitName -match "^\d{4}\.\d{2}\.\d{2}_\d{2}\.\d{2} -- ") {
+                    # config backup commit name is in a format '2023.10.08_01.01 -- ...'
+                    $commitDate
+                  }
+                }
+                if ($lastCommitDate) {
+                  # pick the newest and convert it to datetime object
+                  $lastCommitDate = Get-Date @($lastCommitDate)[0]
+                } else {
+                  Write-Warning "Unable to obtain date of the last backup config commit. ALL Intune audit events will be gathered."
+                }
+
+                # array where objects representing each changed file will be saved with information like who made the change etc
+                $modificationData = New-Object System.Collections.ArrayList
+
+                #region get all Intune audit events since the last commit
+                # it is much faster to get all events at once then retrieve them one by one using resourceId
+                #region create search filter
+                $filter = "activityResult eq 'Success'", "ActivityOperationType ne 'Get'"
+
+                if ($lastCommitDate) {
+                  # Intune logs use UTC time
+                  $lastCommitDate = $lastCommitDate.ToUniversalTime()
+                  $filterDateTimeFrom = Get-Date -Date $lastCommitDate -Format "yyyy-MM-ddTHH:mm:ss"
+                  $filter += "ActivityDateTime ge $filterDateTimeFrom`Z"
+                }
+
+                $backupStart = [DateTime]::ParseExact('$(BACKUP_START)', 'yyyy.MM.dd:HH.mm.ss', $null)
+                $backupStart = $backupStart.ToUniversalTime()
+                $filterDateTimeTo = Get-Date -Date $backupStart -Format "yyyy-MM-ddTHH:mm:ss"
+                $filter += "ActivityDateTime le $filterDateTimeTo`Z"
+
+                $eventFilter = $filter -join " and "
+                #endregion create search filter
+
+                "`nGetting Intune event logs"
+                "`t- from: '$lastCommitDate' (UTC) to: '$backupStart' (UTC)"
+                "`t- filter: $eventFilter"
+                # Get-MgDeviceManagementAuditEvent requires DeviceManagementApps.Read.All scope
+                $modificationEvent = Get-MgDeviceManagementAuditEvent -Filter $eventFilter -All
+                #endregion get all Intune audit events since the last commit
+
+                "`nProcessing changed files"
+                # try to find out who made the change
+                foreach ($file in $changedFile) {
+                  $resourceId = _getResourceId $file
+
+                  # get author of the resource change
+                  if ($resourceId) {
+                    "`t- $resourceId ($file)"
+
+                    $resourceModificationEvent = $modificationEvent | ? { $_.Resources.ResourceId -eq $resourceId }
+
+                    # list of change actors
+                    $modificationAuthorUPN = @()
+
+                    $resourceModificationEvent.Actor | % {
+                      $actor = $_
+
+                      if ($actor.UserPrincipalName) {
+                        # modified by user
+                        $modificationAuthorUPN += $actor.UserPrincipalName
+                      } elseif ($actor.ApplicationDisplayName) {
+                        # modified by service principal
+                        $modificationAuthorUPN += ($actor.ApplicationDisplayName + " (SP)")
+                      }
+                    }
+
+                    $modificationAuthorUPN = $modificationAuthorUPN | select -Unique | Sort-Object
+                  } else {
+                    if ($file -like "*/Assignment Report/report.json") {
+                      # assignment report has no ID because it is generated by IntuneCD
+                    } elseif ($file -like "*/Managed Google Play/*" -or $file -like "*Device Management Settings/settings.json" -or $file -like "*/Apple Push Notification/*") {
+                      # IntuneCD don't gather those resources ID
+                    } elseif ($file -like "*Device Configurations/mobileconfig/*") {
+                      # IntuneCD gather those resources ID in their "parent" JSON, but when DELETE operation occurs, there is no "parent" to gather such data (at least easily)
+                      #FIXME zrusit az budu umet tahat ID i pri DELETE operaci
+                    } else {
+                      throw "Unable to find resourceId in '$file' file name. Pipeline code modification needed, because some changes in IntuneCD were made probably."
+                    }
+
+                    $modificationAuthorUPN = $null
+                  }
+
+                  if ($modificationAuthorUPN) {
+                    "`t`t- changed by: $($modificationAuthorUPN -join ', ')"
+                  } else {
+                    "`t`t- unable to find out who made the change"
+                    $modificationAuthorUPN = 'unknown@unknown.com'
+                  }
+
+                  $null = $modificationData.Add(
+                      [PSCustomObject]@{
+                          resourceId            = $resourceId
+                          file                  = Join-Path $root $file
+                          modificationAuthorUPN = $modificationAuthorUPN
+                      }
+                  )
+                }
+
+                #region commit changes by author(s) who made them
+                "`nCommit changes"
+                # tip: grouping by created string, otherwise doesn't work correctly (probably because modificationAuthorUPN can contains multiple values)!
+                $modificationData | Group-Object { $_.modificationAuthorUPN -join '&'} | % {
+                    $modificationAuthorUPN = $_.Group.ModificationAuthorUPN | Select-Object -Unique
+                    $modificationAuthorName = $modificationAuthorUPN | % { $_.split('@')[0] }
+                    $modifiedFile = $_.Group.File
+
+                    $modifiedFile | % {
+                      "`t- Adding $_"
+                      $gitResult = _startProcess git -ArgumentList "add `"$_`"" -dontWait -outputErr2Std
+                      if ($gitResult -match "^fatal:") {
+                        throw $gitResult
+                      }
+                    }
+
+                    "`t- Setting commit author(s): $($modificationAuthorName -join ', ')"
+                    git config user.name ($modificationAuthorName -join ', ')
+                    git config user.email ($modificationAuthorUPN -join ', ')
+
+                    # in case of any change in commit name, you have to modify retrieval of the $lastCommitDate too!!!
+                    $DATEF = "$(Get-Date $backupStart -f yyyy.MM.dd_HH.mm)"
+                    $commitName = "$DATEF` -- $($modificationAuthorName -join ', ')"
+
+                    "`t- Creating commit '$commitName'"
+                    $null = _startProcess git -ArgumentList "commit -m `"$commitName`"" -dontWait
+
+                    $unpushedCommit = _startProcess git -ArgumentList "cherry -v origin/main"
+                    if ([string]::IsNullOrEmpty($unpushedCommit)) {
+                      # no change detected
+                      # this shouldn't happen, it means that detection of the changed files isn't working correctly
+                      Write-Warning "Nothing to commit?! This shouldn't happen."
+                      # set CHANGE_DETECTED pipeline variable
+                      echo "##vso[task.setVariable variable=CHANGE_DETECTED;isOutput=true;]0"
+                    } else {
+                      "`t`t- Commit was created"
+                      # save commit date to pipeline variable to use it when creating TAG
+                      echo "##vso[task.setVariable variable=COMMIT_DATE;isOutput=true;]$DATEF"
+                      # save modification author(s) to use when creating TAG
+                      echo "##vso[task.setVariable variable=MODIFICATION_AUTHOR;isOutput=true;]$(($modificationData.modificationAuthorUPN | select -Unique | Sort-Object) -join ', ')"
+                    }
+                }
+                #endregion commit changes by author(s) who made them
+
+                "`nPush changes to upstream"
+                $result = _startProcess git -argumentList "push origin HEAD:main" -dontWait -outputErr2Std
+              } else {
+                "No change detected"
+                # set CHANGE_DETECTED pipeline variable
+                echo "##vso[task.setVariable variable=CHANGE_DETECTED;isOutput=true;]0"
+              }
+
+    # Create markdown documentation & commit
+    # - task: Bash@3
+    #   displayName: Generate markdown document & commit
+    #   inputs:
+    #     targetType: 'inline'
+    #     script: |
+    #       if [ "$(commitAndsetVariable.CHANGE_DETECTED)" -eq 1 ]
+    #       then
+    #         INTRO="Intune backup and documentation generated at $(Build.Repository.Uri) <img align=\"right\" width=\"96\" height=\"96\" src=\"./logo.png\">"
+    #         IntuneCD-startdocumentation \
+    #             --path="$(Build.SourcesDirectory)/prod-backup" \
+    #             --outpath="$(Build.SourcesDirectory)/prod-as-built.md" \
+    #             --tenantname=$TENANT_NAME \
+    #             --intro="$INTRO" \
+    #             #--split=Y
+
+    #         # Commit changes and push to repo
+    #         DATEF=`date +%Y.%m.%d`
+    #         git config user.name $(USER_NAME)
+    #         git config user.email $(USER_EMAIL)
+    #         git add --all
+    #         git commit -m "Intune config as-built $DATEF"
+    #         git pull origin main
+    #         git push origin HEAD:main
+    #       else
+    #         echo "no configuration backup change detected in the last commit, documentation will not be created"
+    #       fi
+    #     workingDirectory: '$(Build.SourcesDirectory)'
+    #     failOnStderr: false
+    #   env:
+    #     TENANT_NAME: $(TENANT_NAME)
+
+  - job: tag
+    displayName: Tag repo
+    dependsOn: backup_intune
+    condition: and(succeeded(), eq(dependencies.backup_intune.outputs['commitAndsetVariable.CHANGE_DETECTED'], 1))
+    pool:
+      vmImage: ubuntu-latest
+    continueOnError: false
+    variables:
+      COMMIT_DATE: $[ dependencies.backup_intune.outputs['commitAndSetVariable.COMMIT_DATE'] ]
+      MODIFICATION_AUTHOR: $[ dependencies.backup_intune.outputs['commitAndSetVariable.MODIFICATION_AUTHOR'] ]
+    steps:
+      - checkout: self
+        persistCredentials: true
+
+      # Set git global settings
+      - task: Bash@3
+        displayName: Configure Git
+        inputs:
+          targetType: "inline"
+          script: |
+            git config --global user.name $(USER_NAME)
+            git config --global user.email $(USER_EMAIL)
+          workingDirectory: "$(Build.SourcesDirectory)"
+          failOnStderr: true
+
+      - task: Bash@3
+        displayName: Pull origin
+        inputs:
+          targetType: "inline"
+          script: |
+            git pull origin main
+          workingDirectory: "$(Build.SourcesDirectory)"
+          failOnStderr: false
+
+      - task: PowerShell@2
+        displayName: Git tag
+        inputs:
+          targetType: "inline"
+          script: |
+            # change in configuration backup folder detected, create TAG
+            $DATEF= "$(COMMIT_DATE)"
+            "Creating TAG '$DATEF'"
+            git tag -a "$DATEF" -m "$DATEF -- Intune configuration snapshot (changes made by: $(MODIFICATION_AUTHOR))"
+            git push origin "$DATEF" *> $null # even status information goes to stderr :(
+          failOnStderr: true
+          pwsh: false
+          workingDirectory: "$(Build.SourcesDirectory)"
+  # Publish PDF & HTML documents as an artifacts
+  # - job: publish
+  #   displayName: Publish as-built artifacts
+  #   dependsOn: tag
+  #   condition: and(succeeded(), eq(dependencies.backup_intune.outputs['commitAndsetVariable.CHANGE_DETECTED'], 1))
+  #   pool:
+  #     vmImage: ubuntu-latest
+  #   continueOnError: false
+  #   steps:
+  #   - checkout: self
+  #     persistCredentials: true
+
+  #   # Install md-to-pdf
+  #   # https://github.com/simonhaenisch/md-to-pdf
+  #   - task: Bash@3
+  #     displayName: Install md-to-pdf
+  #     inputs:
+  #       targetType: 'inline'
+  #       script: |
+  #         npm i --location=global md-to-pdf
+  #       workingDirectory: '$(Build.SourcesDirectory)'
+  #       failOnStderr: true
+
+  #   # Convert markdown document to HTML
+  #   - task: Bash@3
+  #     displayName: Convert markdown to HTML
+  #     inputs:
+  #       targetType: 'inline'
+  #       script: |
+  #         cat "$(Build.SourcesDirectory)/prod-as-built.md" | md-to-pdf --config-file "$(Build.SourcesDirectory)/md2pdf/htmlconfig.json" --as-html > "$(Build.SourcesDirectory)/prod-as-built.html"
+  #       workingDirectory: '$(Build.SourcesDirectory)'
+  #       failOnStderr: false
+
+  #   - task: PublishBuildArtifacts@1
+  #     inputs:
+  #       pathToPublish: "$(Build.SourcesDirectory)/prod-as-built.html"
+  #       artifactName: "prod-as-built.html"
+
+  #   # Convert markdown document to PDF
+  #   - task: Bash@3
+  #     displayName: Convert markdown to PDF
+  #     inputs:
+  #       targetType: 'inline'
+  #       script: |
+  #         cat "$(Build.SourcesDirectory)/prod-as-built.md" | md-to-pdf --config-file "$(Build.SourcesDirectory)/md2pdf/pdfconfig.json" > "$(Build.SourcesDirectory)/prod-as-built.pdf"
+  #       workingDirectory: '$(Build.SourcesDirectory)'
+  #       failOnStderr: false
+
+  #   - task: PublishBuildArtifacts@1
+  #     inputs:
+  #       pathToPublish: "$(Build.SourcesDirectory)/prod-as-built.pdf"
+  #       artifactName: "prod-as-built.pdf"
