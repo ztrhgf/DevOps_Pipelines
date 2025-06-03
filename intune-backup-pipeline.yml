@@ -53,7 +53,7 @@ jobs:
           azurePowerShellVersion: "LatestVersion"
           ScriptType: "inlineScript"
           Inline: |
-            $accessToken = (Get-AzAccessToken -ResourceTypeName MSGraph -ErrorAction Stop).Token
+            $accessToken = ([PSCredential]::New('dummy', (Get-AzAccessToken -ResourceTypeName MSGraph -AsSecureString -ErrorAction Stop ).Token).GetNetworkCredential().Password)
             Write-Host "##vso[task.setvariable variable=accessToken;issecret=true]$accessToken"
 
       # Backup the latest configuration, using the current directory
@@ -69,7 +69,7 @@ jobs:
             echo "##vso[task.setVariable variable=BACKUP_START]$BACKUP_START"
 
             IntuneCD-startbackup \
-                -t $(accessToken) \
+                --token $(accessToken) \
                 --mode=1 \
                 --output=json \
                 --path="$(Build.SourcesDirectory)/$(BACKUP_FOLDER)" \

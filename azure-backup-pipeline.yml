@@ -35,7 +35,7 @@ jobs:
           azurePowerShellVersion: "LatestVersion"
           ScriptType: "inlineScript"
           Inline: |
-            $accessToken = (Get-AzAccessToken -ResourceTypeName MSGraph -ErrorAction Stop).Token
+            $accessToken = ([PSCredential]::New('dummy', (Get-AzAccessToken -ResourceTypeName MSGraph -AsSecureString -ErrorAction Stop ).Token).GetNetworkCredential().Password)
             Write-Host "##vso[task.setvariable variable=accessToken;issecret=true]$accessToken"
       - task: PowerShell@2
         displayName: Export backup & commit
