@@ -1,0 +1,198 @@
+# backup intune devices info (laps, bitlocker/filevault keys)
+# required Graph Api scopes: DeviceManagementManagedDevices.Read.All, BitlockerKey.Read.All, DeviceLocalCredential.Read.All, DeviceManagementConfiguration.Read.All, DeviceManagementManagedDevices.PrivilegedOperations.All, user.readbasic.all, device.read.all
+trigger: none
+schedules:
+  - cron: "0 5 * * *"
+    displayName: "5am"
+    branches:
+      include:
+        - main
+    always: true
+variables:
+  - name: SERVICE_CONNECTION_NAME
+    value: device_backup
+
+jobs:
+  - job: backup_device
+    displayName: Export & Commit Device data
+    pool:
+      vmImage: windows-latest
+    continueOnError: false
+    steps:
+      - checkout: self
+        persistCredentials: true
+
+      - task: AzurePowerShell@5
+        displayName: "Get Graph Token for Workload Federated Credential"
+        inputs:
+          azureSubscription: $(SERVICE_CONNECTION_NAME)
+          azurePowerShellVersion: "LatestVersion"
+          ScriptType: "inlineScript"
+          Inline: |
+            $accessToken = ([PSCredential]::New('dummy', (Get-AzAccessToken -ResourceTypeName MSGraph -AsSecureString -ErrorAction Stop ).Token).GetNetworkCredential().Password)
+            Write-Host "##vso[task.setvariable variable=secretToken;issecret=true]$accessToken"
+
+      - task: PowerShell@2
+        displayName: Export device data
+        name: commitAndSetVariable
+        inputs:
+          targetType: "inline"
+          script: |
+            $root = "$(Build.SourcesDirectory)"
+            $bkpLocation = Join-Path $root "device_backup"
+
+            [Void][System.IO.Directory]::CreateDirectory($bkpLocation)
+
+            Set-Location $bkpLocation
+
+            Install-Module -Name MSGraphStuff -AllowClobber -Force -AcceptLicense
+
+            #region authenticate to Graph API using service principal secret
+            Write-Host "Authenticating to Graph API"
+            $secureToken = ConvertTo-SecureString -String $(secretToken) -AsPlainText -Force
+            Connect-MgGraph -AccessToken $secureToken -NoWelcome
+            #endregion authenticate to Graph API using service principal secret
+
+            # configure GIT defaults
+            git config --global user.name 'unknown'
+            git config --global user.email 'unknown@unknown.com'
+            # to avoid 256 limit on Windows
+            git config --global core.longpaths true
+            # to support UNICODE
+            git config --global core.quotepath off
+            # to avoid 'CRLF will be replaced by LF the next time Git touches it'
+            git config --global core.eol lf
+            git config --global core.autocrlf false
+
+            #region MAIN BACKUP LOGIC
+            Write-Host "`nExporting Devices data"
+
+            $mainProperty = 'SerialNumber', 'DeviceName', 'Id', 'AzureAdDeviceId', 'UserPrincipalName', 'OperatingSystem', 'OSVersion', 'ManagementAgent'
+
+            #region get devices basic data
+            #TIP EnrolledDateTime from Intune shows incorrect date, get the Azure RegistrationDateTime instead
+            $deviceRegistration = New-GraphBatchRequest -url "/devices?`$select=DeviceId, RegistrationDateTime" | Invoke-GraphBatchRequest
+            # get all Windows and MacOs managed devices
+            $devices = New-GraphBatchRequest -url "/deviceManagement/managedDevices?`$filter=ManagementAgent eq 'mdm'&`$select=$($mainProperty -join ',')" | Invoke-GraphBatchRequest | ? { $_.OperatingSystem -in 'macOS', 'Windows' } | select $mainProperty | select *, @{n = 'EnrolledDateTime'; e = { $deviceId = $_.AzureAdDeviceId ; ($deviceRegistration | ? DeviceId -EQ $deviceId).RegistrationDateTime } }
+
+            #region get rid of device duplicity records (OS reinstalls etc)
+            $staleDeviceId = @()
+            $devices | group SerialNumber | ? Count -GT 1 | % {
+                $duplicityRecord = $_.group | sort EnrolledDateTime -Descending
+                $newestRecord = $duplicityRecord | select -First 1
+                $duplicityRecord | ? Id -NE $newestRecord.Id | % {
+                    $staleDeviceId += $_.Id
+                }
+            }
+
+            $devices = $devices | ? Id -NotIn $staleDeviceId
+            #endregion get rid of device duplicity records (OS reinstalls etc)
+
+            $windowsClient = $devices | ? OperatingSystem -EQ 'Windows'
+            $macOSClient = $devices | ? OperatingSystem -EQ 'macOS'
+            #endregion get devices basic data
+
+            #region get device to-backup-data
+            # get laps passwords for all windows devices
+            $lapsList = New-GraphBatchRequest -url "/directory/deviceLocalCredentials/<placeholder>?`$select=credentials" -placeholder $windowsClient.AzureAdDeviceId | Invoke-GraphBatchRequest -graphVersion beta
+            # get bitlocker keys for all windows devices
+            $bitlockerKeyList = New-GraphBatchRequest -url "/informationProtection/bitlocker/recoveryKeys" | Invoke-GraphBatchRequest -graphVersion beta | ? deviceId -in $windowsClient.AzureAdDeviceId
+            # get actual bitlocker key values
+            $bitlockerKeyValueList = New-GraphBatchRequest -url "/informationProtection/bitlocker/recoveryKeys/<placeholder>?`$select=key" -placeholder $bitlockerKeyList.Id | Invoke-GraphBatchRequest -graphVersion beta
+            # get FileVault keys for all MacOs devices
+            # TIP if device doesn't yet have the fileVault key saved in the Intune, the request fails with the 404
+            # TIP 'ErrorAction = SilentlyContinue' because of this pipeline setting failOnStderr: true (which is needed to know backup isn't working)
+            $fileVaultKeyList = New-GraphBatchRequest -url "/deviceManagement/managedDevices('<placeholder>')/getFileVaultKey" -placeholderAsId -placeholder $macOSClient.Id | Invoke-GraphBatchRequest -graphVersion beta -ErrorVariable fileVaultError -ErrorAction SilentlyContinue
+
+            if ($fileVaultError -notlike "*StatusCode: '404'*") {
+                throw $fileVaultError
+            } else {
+                Write-Warning "MacOs device without FileVault key stored in the Intune: $(($fileVaultKeyList | ? {!($_.Value)}).RequestId -join ', ')"
+            }
+
+            # create finalized device objects with all required properties
+            $result = foreach ($device in $devices) {
+                $deviceOS = $device.OperatingSystem
+                $enrolledDateTime = $device.EnrolledDateTime
+
+                Write-Warning "Processing $($device.DeviceName) ($($device.SerialNumber))"
+
+                switch ($deviceOS) {
+                    'Windows' {
+                        $deviceId = $device.AzureAdDeviceId
+
+                        # Bitlocker
+                        $bitLockerKeyId = $bitlockerKeyList | ? { $_.DeviceId -eq $deviceId -and $_.CreatedDateTime -ge $enrolledDateTime } | select -ExpandProperty Id
+                        $bitLockerKey = $bitlockerKeyValueList | ? Id -In $bitLockerKeyId | select id, key, createdDateTime | sort id
+
+                        # LAPS
+                        $newestLAPSPassword = $lapsList | ? Id -EQ $deviceId | select -ExpandProperty credentials | sort -Descending backupDateTime | select -First 1 -Property @{n = 'accountName'; e = { $_.accountName } }, @{n = 'backupDateTime'; e = { $_.backupDateTime } }, @{n = 'password'; e = { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($_.passwordBase64)) } }
+
+                        $device | select -Property *, @{n = 'Bitlocker'; e = { $bitLockerKey } }, @{n = 'LAPS'; e = { $newestLAPSPassword } } -ExcludeProperty ManagementAgent
+                    }
+
+                    'macOS' {
+                        $deviceId = $device.Id
+
+                        # FileVault
+                        $fileVaultKey = ($fileVaultKeyList | ? RequestId -eq $deviceId).Value
+
+                        $device | select -Property *, @{n = 'FileVault'; e = { $fileVaultKey } } -ExcludeProperty ManagementAgent
+                    }
+
+                    default { throw "Undefined OS" }
+                }
+            }
+
+            if (!$devices -or !$result.Bitlocker -or !$result.LAPS -or !$result.FileVault) {
+                throw "Backup isn't working correctly!"
+            }
+
+            # export data to JSON files
+            foreach ($deviceData in $result) {
+                $deviceOS = $deviceData.OperatingSystem
+                $serialNumber = $deviceData.SerialNumber
+
+                if (!$deviceOS) {
+                    $deviceData
+                    throw "'OperatingSystem' property is empty!"
+                }
+                if (!$serialNumber) {
+                    $deviceData
+                    throw "'SerialNumber' property is empty!"
+                }
+
+                $deviceBkpLocation = Join-Path $bkpLocation $deviceOS
+
+                [Void][System.IO.Directory]::CreateDirectory($deviceBkpLocation)
+
+                $deviceData | ConvertTo-Json -Depth 10 | Out-File -FilePath (Join-Path $deviceBkpLocation "$serialNumber.json") -Encoding utf8 -Force
+            }
+            #endregion MAIN BACKUP LOGIC
+          failOnStderr: true
+          pwsh: true
+
+      # Commit changes and push to repo
+      - task: Bash@3
+        displayName: Commit & Tag changes
+        inputs:
+          targetType: "inline"
+          script: |
+            DATEF=`date +%Y.%m.%d`
+            # configure GIT defaults
+            # to avoid 256 limit on Windows
+            git config --global core.longpaths true
+            # to support UNICODE
+            git config --global core.quotepath off
+            # to avoid 'CRLF will be replaced by LF the next time Git touches it'
+            git config --global core.eol lf
+            git config --global core.autocrlf false
+
+            git add --all
+            git commit -m "Device data backup $DATEF"
+            git push origin HEAD:main
+
+            git tag -a $DATEF -m "$DATEF"
+            git push origin HEAD:main "$DATEF"
+          workingDirectory: "$(Build.SourcesDirectory)"
+          failOnStderr: false
