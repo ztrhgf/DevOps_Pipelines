@@ -1,5 +1,27 @@
-# backup intune devices info (laps, bitlocker/filevault keys)
-# required Graph Api scopes: DeviceManagementManagedDevices.Read.All, BitlockerKey.Read.All, DeviceLocalCredential.Read.All, DeviceManagementConfiguration.Read.All, DeviceManagementManagedDevices.PrivilegedOperations.All, user.readbasic.all, device.read.all
+#####################################################################################################
+
+# https://doitpshway.com/exporting-bitlocker-laps-and-filevault-keys-from-intune-to-git-using-azure-devops-pipeline
+
+# !!! SET PIPELINE VARIABLES TO SUIT YOUR ENVIRONMENT !!!
+
+# WIF pipeline identity requirements:
+# - Graph Api application scopes: DeviceManagementManagedDevices.Read.All, BitlockerKey.Read.All, DeviceLocalCredential.Read.All, DeviceManagementConfiguration.Read.All, DeviceManagementManagedDevices.PrivilegedOperations.All, User.ReadBasic.All, Device.Read.All
+# - pipeline account must have Contribute permission over the repository (to be able tu push changes)
+
+# TO ENABLE SECRETS ENCRYPTION
+# - generate a strong password and save it to KeyVault secret
+# - put the name of the KeyVault into the "KEY_VAULT_NAME" pipeline variable
+# - put the name of the secret into the "ENCRYPTION_KEY_SECRET_NAME" pipeline variable
+# - assign WIF identity the 'Key Vault Secrets User' role over the KeyVault secret
+# - used KeyVault must be in the same subscription you used when creating the WIF identity!
+
+# TO DECRYPT A SECRET:
+# $encryptionKey = Get-AzKeyVaultSecret -VaultName "<someKeyVaultName>" -Name "<someSecretName>"
+# $encryptionKeyValue = $encryptionKey.SecretValue | ConvertFrom-SecureString -AsPlainText
+# $decryptedText = ConvertFrom-EncryptedString -EncryptedText "<encryptedSecret>" -Key $encryptionKeyValue
+
+#####################################################################################################
+
 trigger: none
 schedules:
   - cron: "0 5 * * *"
@@ -10,7 +32,17 @@ schedules:
     always: true
 variables:
   - name: SERVICE_CONNECTION_NAME
-    value: device_backup
+    value: <someSCName>
+  - name: KEY_VAULT_NAME
+    value: "<someKeyVaultName>"
+  - name: ENCRYPTION_KEY_SECRET_NAME
+    value: "<someSecretName>"  # Secret name in KeyVault that contains the encryption password
+  - name: INCLUDE_LAPS
+    value: "true"  # Set to "false" to exclude LAPS passwords from backup
+  - name: INCLUDE_BITLOCKER
+    value: "true"  # Set to "false" to exclude BitLocker keys from backup
+  - name: INCLUDE_FILEVAULT
+    value: "true"  # Set to "false" to exclude FileVault keys from backup
 
 jobs:
   - job: backup_device
@@ -23,19 +55,42 @@ jobs:
         persistCredentials: true
 
       - task: AzurePowerShell@5
-        displayName: "Get Graph Token for Workload Federated Credential"
+        displayName: "Get Graph Token"
         inputs:
           azureSubscription: $(SERVICE_CONNECTION_NAME)
           azurePowerShellVersion: "LatestVersion"
           ScriptType: "inlineScript"
           Inline: |
+            # Get Graph API token
             $accessToken = ([PSCredential]::New('dummy', (Get-AzAccessToken -ResourceTypeName MSGraph -AsSecureString -ErrorAction Stop ).Token).GetNetworkCredential().Password)
             Write-Host "##vso[task.setvariable variable=secretToken;issecret=true]$accessToken"
+
+      - task: AzurePowerShell@5
+        displayName: "Get Encryption Key from KeyVault"
+        condition: and(succeeded(), ne(variables['KEY_VAULT_NAME'], ''))
+        inputs:
+          azureSubscription: $(SERVICE_CONNECTION_NAME)
+          azurePowerShellVersion: "LatestVersion"
+          pwsh: true
+          ScriptType: "inlineScript"
+          Inline: |
+            # Get encryption key from KeyVault
+            Write-Host "Retrieving encryption key from KeyVault $(KEY_VAULT_NAME)"
+            try {
+                $encryptionKey = Get-AzKeyVaultSecret -VaultName "$(KEY_VAULT_NAME)" -Name "$(ENCRYPTION_KEY_SECRET_NAME)" -ErrorAction Stop
+                $encryptionKeyValue = $encryptionKey.SecretValue | ConvertFrom-SecureString -AsPlainText
+                Write-Host "##vso[task.setvariable variable=encryptionKey;issecret=true]$encryptionKeyValue"
+                Write-Host "Encryption key retrieved successfully"
+            } catch {
+                throw "Failed to retrieve encryption key from KeyVault: $_"
+            }
 
       - task: PowerShell@2
         displayName: Export device data
         name: commitAndSetVariable
         inputs:
+          failOnStderr: true
+          pwsh: true
           targetType: "inline"
           script: |
             $root = "$(Build.SourcesDirectory)"
@@ -46,12 +101,54 @@ jobs:
             Set-Location $bkpLocation
 
             Install-Module -Name MSGraphStuff -AllowClobber -Force -AcceptLicense
+            Install-Module -Name CommonStuff -AllowClobber -Force -AcceptLicense
 
             #region authenticate to Graph API using service principal secret
             Write-Host "Authenticating to Graph API"
             $secureToken = ConvertTo-SecureString -String $(secretToken) -AsPlainText -Force
             Connect-MgGraph -AccessToken $secureToken -NoWelcome
             #endregion authenticate to Graph API using service principal secret
+
+            #region encryption setup
+            $encryptionEnabled = $false
+            $encryptionKeyPlain = $null
+
+            if (![string]::IsNullOrEmpty('$(encryptionKey)')) {
+                Write-Host "Encryption is enabled for sensitive data. Use 'ConvertFrom-EncryptedString' function for decryption."
+                $encryptionEnabled = $true
+                $encryptionKeyPlain = '$(encryptionKey)'
+
+                # Verify encryption is working
+                try {
+                    $testString = "Test encryption"
+                    $encryptedTest = ConvertTo-EncryptedString -TextToEncrypt $testString -Key $encryptionKeyPlain
+                    if ([string]::IsNullOrEmpty($encryptedTest)) {
+                        throw "Encryption test failed: Encrypted result is empty"
+                    }
+                    Write-Host "Encryption test completed successfully"
+                } catch {
+                    Write-Error "Encryption verification failed: $_"
+                    throw "Failed to set up encryption. Aborting to prevent unencrypted backup."
+                }
+            } else {
+                Write-Warning "Encryption key not provided. Sensitive data will NOT be encrypted!"
+            }
+            #endregion encryption setup
+
+            #region backup options setup
+            $includeLAPS = '$(INCLUDE_LAPS)' -eq 'true'
+            $includeBitLocker = '$(INCLUDE_BITLOCKER)' -eq 'true'
+            $includeFileVault = '$(INCLUDE_FILEVAULT)' -eq 'true'
+
+            Write-Host "Backup options:"
+            Write-Host "  LAPS: $includeLAPS"
+            Write-Host "  BitLocker: $includeBitLocker"
+            Write-Host "  FileVault: $includeFileVault"
+
+            if (!$includeLAPS -and !$includeBitLocker -and !$includeFileVault) {
+                throw "At least one backup option (LAPS, BitLocker, or FileVault) must be enabled!"
+            }
+            #endregion backup options setup
 
             # configure GIT defaults
             git config --global user.name 'unknown'
@@ -92,64 +189,376 @@ jobs:
             $macOSClient = $devices | ? OperatingSystem -EQ 'macOS'
             #endregion get devices basic data
 
-            #region get device to-backup-data
-            # get laps passwords for all windows devices
-            $lapsList = New-GraphBatchRequest -url "/directory/deviceLocalCredentials/<placeholder>?`$select=credentials" -placeholder $windowsClient.AzureAdDeviceId | Invoke-GraphBatchRequest -graphVersion beta
-            # get bitlocker keys for all windows devices
-            $bitlockerKeyList = New-GraphBatchRequest -url "/informationProtection/bitlocker/recoveryKeys" | Invoke-GraphBatchRequest -graphVersion beta | ? deviceId -in $windowsClient.AzureAdDeviceId
-            # get actual bitlocker key values
-            $bitlockerKeyValueList = New-GraphBatchRequest -url "/informationProtection/bitlocker/recoveryKeys/<placeholder>?`$select=key" -placeholder $bitlockerKeyList.Id | Invoke-GraphBatchRequest -graphVersion beta
-            # get FileVault keys for all MacOs devices
-            # TIP if device doesn't yet have the fileVault key saved in the Intune, the request fails with the 404
-            # TIP 'ErrorAction = SilentlyContinue' because of this pipeline setting failOnStderr: true (which is needed to know backup isn't working)
-            $fileVaultKeyList = New-GraphBatchRequest -url "/deviceManagement/managedDevices('<placeholder>')/getFileVaultKey" -placeholderAsId -placeholder $macOSClient.Id | Invoke-GraphBatchRequest -graphVersion beta -ErrorVariable fileVaultError -ErrorAction SilentlyContinue
+            #region helper function for comparing and reusing encrypted values
+            function Compare-And-ReuseEncrypted {
+                param(
+                    [string]$NewPlainValue,
+                    [string]$ExistingEncryptedValue,
+                    [string]$EncryptionKey
+                )
 
-            if ($fileVaultError -notlike "*StatusCode: '404'*") {
-                throw $fileVaultError
-            } else {
-                Write-Warning "MacOs device without FileVault key stored in the Intune: $(($fileVaultKeyList | ? {!($_.Value)}).RequestId -join ', ')"
+                if ([string]::IsNullOrEmpty($ExistingEncryptedValue) -or [string]::IsNullOrEmpty($NewPlainValue)) {
+                    return $null
+                }
+
+                try {
+                    # Decrypt existing value for comparison
+                    $existingPlainValue = ConvertFrom-EncryptedString -EncryptedText $ExistingEncryptedValue -Key $EncryptionKey
+
+                    # If values are the same, reuse the encrypted version
+                    if ($NewPlainValue -eq $existingPlainValue) {
+                        return $ExistingEncryptedValue
+                    }
+                } catch {
+                    Write-Warning "Failed to decrypt existing value for comparison: $_"
+                }
+
+                return $null
+            }
+            #endregion helper function
+
+            #region load existing device data for comparison
+            $existingDeviceData = @{}
+            if (Test-Path $bkpLocation) {
+                Get-ChildItem -Path $bkpLocation -Recurse -Filter "*.json" | ForEach-Object {
+                    try {
+                        $content = Get-Content $_.FullName -Raw | ConvertFrom-Json
+                        $existingDeviceData[$content.SerialNumber] = $content
+                    } catch {
+                        throw "Failed to load existing data from $($_.FullName): $_"
+                    }
+                }
+            }
+            #endregion load existing device data
+
+            #region get device to-backup-data
+            # get laps passwords for all windows devices (if enabled)
+            $lapsList = @()
+            if ($includeLAPS -and $windowsClient) {
+                $lapsList = New-GraphBatchRequest -url "/directory/deviceLocalCredentials/<placeholder>?`$select=credentials" -placeholder $windowsClient.AzureAdDeviceId | Invoke-GraphBatchRequest -graphVersion beta
+            }
+
+            # get bitlocker keys for all windows devices (if enabled)
+            $bitlockerKeyList = @()
+            $bitlockerKeyValueList = @()
+
+            if ($includeBitLocker -and $windowsClient) {
+                $bitlockerKeyList = New-GraphBatchRequest -url "/informationProtection/bitlocker/recoveryKeys" | Invoke-GraphBatchRequest -graphVersion beta | ? deviceId -In $windowsClient.AzureAdDeviceId
+                # get actual bitlocker key values
+                if ($bitlockerKeyList) {
+                    $bitlockerKeyValueList = New-GraphBatchRequest -url "/informationProtection/bitlocker/recoveryKeys/<placeholder>?`$select=key" -placeholder $bitlockerKeyList.Id | Invoke-GraphBatchRequest -graphVersion beta
+                }
+            }
+
+            # get FileVault keys for all MacOs devices (if enabled)
+            $fileVaultKeyList = @()
+
+            if ($includeFileVault -and $macOSClient) {
+                # TIP if device doesn't yet have the fileVault key saved in the Intune, the request fails with the 404
+                # TIP 'ErrorAction = SilentlyContinue' because of this pipeline setting failOnStderr: true (which is needed to know backup isn't working)
+                $fileVaultKeyList = New-GraphBatchRequest -url "/deviceManagement/managedDevices('<placeholder>')/getFileVaultKey" -placeholderAsId -placeholder $macOSClient.Id | Invoke-GraphBatchRequest -graphVersion beta -ErrorVariable fileVaultError -ErrorAction SilentlyContinue
+
+                if ($fileVaultError -notlike "*StatusCode: '404'*") {
+                    throw $fileVaultError
+                } else {
+                    Write-Warning "MacOs device without FileVault key stored in the Intune: $(($fileVaultKeyList | ? {!($_.Value)}).RequestId -join ', ')"
+                }
             }
 
             # create finalized device objects with all required properties
             $result = foreach ($device in $devices) {
                 $deviceOS = $device.OperatingSystem
                 $enrolledDateTime = $device.EnrolledDateTime
+                $serialNumber = $device.SerialNumber
+                $existingDevice = $existingDeviceData[$serialNumber]
+                $hasChanges = $false
 
-                Write-Warning "Processing $($device.DeviceName) ($($device.SerialNumber))"
+                Write-Warning "Processing $($device.DeviceName) ($serialNumber)"
 
                 switch ($deviceOS) {
                     'Windows' {
                         $deviceId = $device.AzureAdDeviceId
 
-                        # Bitlocker
-                        $bitLockerKeyId = $bitlockerKeyList | ? { $_.DeviceId -eq $deviceId -and $_.CreatedDateTime -ge $enrolledDateTime } | select -ExpandProperty Id
-                        $bitLockerKey = $bitlockerKeyValueList | ? Id -In $bitLockerKeyId | select id, key, createdDateTime | sort id
+                        # Bitlocker (if enabled)
+                        [System.Collections.Generic.List[object]] $processedBitLockerKeys = @()
+                        $bitLockerChanged = $false
 
-                        # LAPS
-                        $newestLAPSPassword = $lapsList | ? Id -EQ $deviceId | select -ExpandProperty credentials | sort -Descending backupDateTime | select -First 1 -Property @{n = 'accountName'; e = { $_.accountName } }, @{n = 'backupDateTime'; e = { $_.backupDateTime } }, @{n = 'password'; e = { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($_.passwordBase64)) } }
+                        if ($includeBitLocker) {
+                            $bitLockerKeyId = $bitlockerKeyList | ? { $_.DeviceId -eq $deviceId -and $_.CreatedDateTime -ge $enrolledDateTime } | select -ExpandProperty Id
+                            $bitLockerKeyObjects = $bitlockerKeyValueList | ? Id -In $bitLockerKeyId | sort id
 
-                        $device | select -Property *, @{n = 'Bitlocker'; e = { $bitLockerKey } }, @{n = 'LAPS'; e = { $newestLAPSPassword } } -ExcludeProperty ManagementAgent
+                            # Compare BitLocker keys by ID to detect changes
+                            $existingBitLockerIds = @()
+                            if ($existingDevice -and $existingDevice.Bitlocker) {
+                                $existingBitLockerIds = $existingDevice.Bitlocker | Select-Object -ExpandProperty id
+                            }
+
+                            $currentBitLockerIds = $bitLockerKeyObjects | Select-Object -ExpandProperty id
+
+                            # Check if BitLocker key sets are different - ensure both arrays are not null
+                            if ($existingBitLockerIds -and $currentBitLockerIds) {
+                                if (Compare-Object $existingBitLockerIds $currentBitLockerIds) {
+                                    $bitLockerChanged = $true
+                                    $hasChanges = $true
+                                }
+                            } elseif ($existingBitLockerIds -or $currentBitLockerIds) {
+                                # One is null/empty and the other isn't - this is a change
+                                $bitLockerChanged = $true
+                                $hasChanges = $true
+                            }
+
+                            foreach ($blKey in $bitLockerKeyObjects) {
+                                $existingBLKey = $null
+                                if ($existingDevice -and $existingDevice.Bitlocker) {
+                                    $existingBLKey = $existingDevice.Bitlocker | Where-Object { $_.id -eq $blKey.id }
+                                }
+
+                                if ($encryptionEnabled -and $blKey.key) {
+                                    # Try to reuse existing encrypted value if key hasn't changed
+                                    $reusedEncrypted = $null
+                                    if ($existingBLKey -and $existingBLKey.key -and !$bitLockerChanged) {
+                                        $reusedEncrypted = Compare-And-ReuseEncrypted -NewPlainValue $blKey.key -ExistingEncryptedValue $existingBLKey.key -EncryptionKey $encryptionKeyPlain
+                                    }
+
+                                    if ($reusedEncrypted) {
+                                        $key = $reusedEncrypted
+                                    } else {
+                                        $key = ConvertTo-EncryptedString -TextToEncrypt $blKey.key -Key $encryptionKeyPlain
+                                        if ($existingBLKey) {
+                                            $hasChanges = $true
+                                        }
+                                    }
+                                } else {
+                                    $key = $blKey.key
+                                    if ($existingBLKey -and $existingBLKey.key -ne $key) {
+                                        $hasChanges = $true
+                                    }
+                                }
+
+                                $processedBitLockerKeys.Add([PSCustomObject]@{
+                                        id              = $blKey.id
+                                        key             = $key
+                                        createdDateTime = $blKey.createdDateTime
+                                    })
+                            }
+                        } else {
+                            # BitLocker not included - check if it was previously included
+                            if ($existingDevice -and $existingDevice.Bitlocker) {
+                                $hasChanges = $true  # BitLocker was removed from backup
+                            }
+                        }
+
+                        # LAPS (if enabled)
+                        $processedLAPSPassword = $null
+
+                        if ($includeLAPS) {
+                            $newestLAPSPassword = $lapsList | ? Id -EQ $deviceId | select -ExpandProperty credentials | sort -Descending backupDateTime | select -First 1
+
+                            if ($newestLAPSPassword) {
+                                $accountName = $newestLAPSPassword.accountName
+                                $backupDateTime = $newestLAPSPassword.backupDateTime
+                                $rawPassword = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($newestLAPSPassword.passwordBase64))
+
+                                # Process LAPS password - encrypt if enabled and check for changes
+                                if ($encryptionEnabled) {
+                                    # Try to reuse existing encrypted value if password hasn't changed
+                                    $reusedEncrypted = $null
+                                    if ($existingDevice -and $existingDevice.LAPS -and $existingDevice.LAPS.password) {
+                                        $reusedEncrypted = Compare-And-ReuseEncrypted -NewPlainValue $rawPassword -ExistingEncryptedValue $existingDevice.LAPS.password -EncryptionKey $encryptionKeyPlain
+                                    }
+
+                                    if ($reusedEncrypted) {
+                                        $password = $reusedEncrypted
+                                    } else {
+                                        $password = ConvertTo-EncryptedString -TextToEncrypt $rawPassword -Key $encryptionKeyPlain
+                                        if ($existingDevice -and $existingDevice.LAPS) {
+                                            $hasChanges = $true
+                                        }
+                                    }
+                                } else {
+                                    $password = $rawPassword
+                                    if ($existingDevice -and $existingDevice.LAPS -and $existingDevice.LAPS.password -ne $password) {
+                                        $hasChanges = $true
+                                    }
+                                }
+
+                                $processedLAPSPassword = [PSCustomObject]@{
+                                    accountName    = $accountName
+                                    backupDateTime = $backupDateTime
+                                    password       = $password
+                                }
+
+                                # Check if LAPS data structure changed
+                                if ($existingDevice) {
+                                    if (!$existingDevice.LAPS -or
+                                        $existingDevice.LAPS.accountName -ne $accountName -or
+                                        $existingDevice.LAPS.backupDateTime -ne $backupDateTime) {
+                                        $hasChanges = $true
+                                    }
+                                }
+                            }
+                        } else {
+                            # LAPS not included - check if it was previously included
+                            if ($existingDevice -and $existingDevice.LAPS) {
+                                $hasChanges = $true  # LAPS was removed from backup
+                            }
+                        }
+
+                        # Check if device basic properties changed
+                        if ($existingDevice) {
+                            $deviceProps = @('DeviceName', 'Id', 'AzureAdDeviceId', 'UserPrincipalName', 'OperatingSystem', 'OSVersion', 'EnrolledDateTime')
+                            foreach ($prop in $deviceProps) {
+                                if ($device.$prop -ne $existingDevice.$prop) {
+                                    $hasChanges = $true
+                                    break
+                                }
+                            }
+                        } else {
+                            $hasChanges = $true  # New device
+                        }
+
+                        # Return device data with change flag
+                        $deviceProperties = $device | Select-Object * -ExcludeProperty ManagementAgent
+
+                        # Conditionally add backup properties
+                        if ($includeBitLocker) {
+                            $deviceProperties = $deviceProperties | Select-Object *, @{n = 'Bitlocker'; e = { $processedBitLockerKeys } }
+                        }
+                        if ($includeLAPS) {
+                            $deviceProperties = $deviceProperties | Select-Object *, @{n = 'LAPS'; e = { $processedLAPSPassword } }
+                        }
+
+                        [PSCustomObject]@{
+                            DeviceData = $deviceProperties
+                            HasChanges = $hasChanges
+                        }
                     }
 
                     'macOS' {
                         $deviceId = $device.Id
 
-                        # FileVault
-                        $fileVaultKey = ($fileVaultKeyList | ? RequestId -eq $deviceId).Value
+                        # FileVault (if enabled)
+                        $processedFileVaultKey = $null
 
-                        $device | select -Property *, @{n = 'FileVault'; e = { $fileVaultKey } } -ExcludeProperty ManagementAgent
+                        if ($includeFileVault) {
+                            $rawFileVaultKey = ($fileVaultKeyList | ? RequestId -EQ $deviceId).Value
+
+                            # Process FileVault key - encrypt if enabled and check for changes
+                            if ($rawFileVaultKey) {
+                                if ($encryptionEnabled) {
+                                    # Try to reuse existing encrypted value if key hasn't changed
+                                    $reusedEncrypted = $null
+                                    if ($existingDevice -and $existingDevice.FileVault -and $existingDevice.FileVault.key) {
+                                        $reusedEncrypted = Compare-And-ReuseEncrypted -NewPlainValue $rawFileVaultKey -ExistingEncryptedValue $existingDevice.FileVault.key -EncryptionKey $encryptionKeyPlain
+                                    }
+
+                                    if ($reusedEncrypted) {
+                                        $key = $reusedEncrypted
+                                    } else {
+                                        $key = ConvertTo-EncryptedString -TextToEncrypt $rawFileVaultKey -Key $encryptionKeyPlain
+                                        if ($existingDevice -and $existingDevice.FileVault) {
+                                            $hasChanges = $true
+                                        }
+                                    }
+                                } else {
+                                    $key = $rawFileVaultKey
+                                    if ($existingDevice -and $existingDevice.FileVault -and $existingDevice.FileVault.key -ne $key) {
+                                        $hasChanges = $true
+                                    }
+                                }
+
+                                $processedFileVaultKey = [PSCustomObject]@{
+                                    key = $key
+                                }
+
+                                # Check if FileVault was added/removed
+                                if (($existingDevice -and !$existingDevice.FileVault) -or (!$existingDevice)) {
+                                    $hasChanges = $true
+                                }
+                            }
+                        } else {
+                            # FileVault not included - check if it was previously included
+                            if ($existingDevice -and $existingDevice.FileVault) {
+                                $hasChanges = $true  # FileVault was removed from backup
+                            }
+                        }
+
+                        # Check if device basic properties changed
+                        if ($existingDevice) {
+                            $deviceProps = @('DeviceName', 'Id', 'AzureAdDeviceId', 'UserPrincipalName', 'OperatingSystem', 'OSVersion', 'EnrolledDateTime')
+                            foreach ($prop in $deviceProps) {
+                                if ($device.$prop -ne $existingDevice.$prop) {
+                                    $hasChanges = $true
+                                    break
+                                }
+                            }
+                        } else {
+                            $hasChanges = $true  # New device
+                        }
+
+                        # Return device data with change flag
+                        $deviceProperties = $device | Select-Object * -ExcludeProperty ManagementAgent
+
+                        # Conditionally add backup properties
+                        if ($includeFileVault) {
+                            $deviceProperties = $deviceProperties | Select-Object *, @{n = 'FileVault'; e = { $processedFileVaultKey } }
+                        }
+
+                        [PSCustomObject]@{
+                            DeviceData = $deviceProperties
+                            HasChanges = $hasChanges
+                        }
                     }
 
                     default { throw "Undefined OS" }
                 }
             }
 
-            if (!$devices -or !$result.Bitlocker -or !$result.LAPS -or !$result.FileVault) {
-                throw "Backup isn't working correctly!"
+            # Verify we have the expected data
+            if (!$devices) {
+                throw "No devices found for backup!"
             }
 
-            # export data to JSON files
-            foreach ($deviceData in $result) {
+            # Verify enabled backup options have data where expected
+            $verificationErrors = @()
+
+            if ($includeBitLocker -and $windowsClient) {
+                $bitLockerDevicesWithData = ($result.DeviceData | Where-Object { $_.OperatingSystem -eq 'Windows' -and $_.Bitlocker })
+                if (!$bitLockerDevicesWithData) {
+                    $verificationErrors += "BitLocker backup is enabled but no Windows devices have BitLocker data"
+                }
+            }
+
+            if ($includeLAPS -and $windowsClient) {
+                $lapsDevicesWithData = ($result.DeviceData | Where-Object { $_.OperatingSystem -eq 'Windows' -and $_.LAPS })
+                if (!$lapsDevicesWithData) {
+                    $verificationErrors += "LAPS backup is enabled but no Windows devices have LAPS data"
+                }
+            }
+
+            if ($includeFileVault -and $macOSClient) {
+                $fileVaultDevicesWithData = ($result.DeviceData | Where-Object { $_.OperatingSystem -eq 'macOS' -and $_.FileVault })
+                if (!$fileVaultDevicesWithData) {
+                    $verificationErrors += "FileVault backup is enabled but no macOS devices have FileVault data"
+                }
+            }
+
+            if ($verificationErrors) {
+                Write-Warning "Backup verification warnings:"
+                $verificationErrors | ForEach-Object { Write-Warning "  - $_" }
+                Write-Warning "This may be expected if devices don't have the required security features configured."
+            }
+
+            # Track changes for git commit decision
+            $changedDevices = 0
+            $totalDevices = 0
+
+            # export data to JSON files only if changes detected
+            foreach ($deviceResult in $result) {
+                $deviceData = $deviceResult.DeviceData
+                $hasChanges = $deviceResult.HasChanges
+                $totalDevices++
+
                 $deviceOS = $deviceData.OperatingSystem
                 $serialNumber = $deviceData.SerialNumber
 
@@ -163,22 +572,51 @@ jobs:
                 }
 
                 $deviceBkpLocation = Join-Path $bkpLocation $deviceOS
-
                 [Void][System.IO.Directory]::CreateDirectory($deviceBkpLocation)
 
-                $deviceData | ConvertTo-Json -Depth 10 | Out-File -FilePath (Join-Path $deviceBkpLocation "$serialNumber.json") -Encoding utf8 -Force
+                $jsonPath = Join-Path $deviceBkpLocation "$serialNumber.json"
+
+                if ($hasChanges) {
+                    $changedDevices++
+                    Write-Host "Changes detected for device $($deviceData.DeviceName) ($serialNumber) - updating JSON file"
+
+                    # Add encryption status to the device data
+                    $deviceDataWithMeta = $deviceData | Select-Object *, @{n = 'encryptionEnabled'; e = { $encryptionEnabled } }
+                    $deviceDataWithMeta | ConvertTo-Json -Depth 10 | Out-File -FilePath $jsonPath -Encoding utf8 -Force
+                } else {
+                    Write-Host "No changes detected for device $($deviceData.DeviceName) ($serialNumber) - skipping JSON update"
+
+                    # Ensure the file exists even if no changes (in case it was deleted)
+                    if (-not (Test-Path $jsonPath)) {
+                        Write-Host "JSON file missing for $($deviceData.DeviceName) ($serialNumber) - creating it"
+                        $deviceDataWithMeta = $deviceData | Select-Object *, @{n = 'encryptionEnabled'; e = { $encryptionEnabled } }
+                        $deviceDataWithMeta | ConvertTo-Json -Depth 10 | Out-File -FilePath $jsonPath -Encoding utf8 -Force
+                        $changedDevices++
+                    }
+                }
+            }
+
+            Write-Host "Processing complete: $changedDevices of $totalDevices devices had changes"
+
+            # Set variable to indicate if any changes were made
+            if ($changedDevices -gt 0) {
+                Write-Host "##vso[task.setvariable variable=hasChanges;isOutput=true]true"
+                Write-Host "##vso[task.setvariable variable=changedDevicesCount;isOutput=true]$changedDevices"
+            } else {
+                Write-Host "##vso[task.setvariable variable=hasChanges;isOutput=true]false"
+                Write-Host "##vso[task.setvariable variable=changedDevicesCount;isOutput=true]0"
             }
             #endregion MAIN BACKUP LOGIC
-          failOnStderr: true
-          pwsh: true
 
       # Commit changes and push to repo
       - task: Bash@3
         displayName: Commit & Tag changes
+        condition: and(succeeded(), eq(variables['commitAndSetVariable.hasChanges'], 'true'))
         inputs:
           targetType: "inline"
           script: |
             DATEF=`date +%Y.%m.%d`
+            CHANGED_COUNT=$(commitAndSetVariable.changedDevicesCount)
             # configure GIT defaults
             # to avoid 256 limit on Windows
             git config --global core.longpaths true
@@ -189,10 +627,20 @@ jobs:
             git config --global core.autocrlf false
 
             git add --all
-            git commit -m "Device data backup $DATEF"
+            git commit -m "Device data backup $DATEF - Updated $CHANGED_COUNT devices"
             git push origin HEAD:main
 
-            git tag -a $DATEF -m "$DATEF"
+            git tag -a $DATEF -m "$DATEF - Updated $CHANGED_COUNT devices"
             git push origin HEAD:main "$DATEF"
           workingDirectory: "$(Build.SourcesDirectory)"
           failOnStderr: false
+
+      # Log when no changes detected
+      - task: PowerShell@2
+        displayName: Log no changes
+        condition: and(succeeded(), eq(variables['commitAndSetVariable.hasChanges'], 'false'))
+        inputs:
+          targetType: "inline"
+          script: |
+            Write-Host "No device data changes detected - skipping git commit"
+          pwsh: true
