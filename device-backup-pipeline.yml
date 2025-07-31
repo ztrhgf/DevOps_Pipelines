@@ -32,9 +32,9 @@ schedules:
     always: true
 variables:
   - name: SERVICE_CONNECTION_NAME
-    value: <someSCName>
+    value: <someSCName> # Name that was chosen when WIF was created
   - name: KEY_VAULT_NAME
-    value: "<someKeyVaultName>"
+    value: "<someKeyVaultName>" # Name of the KeyVault where encryption password is stored
   - name: ENCRYPTION_KEY_SECRET_NAME
     value: "<someSecretName>"  # Secret name in KeyVault that contains the encryption password
   - name: INCLUDE_LAPS
