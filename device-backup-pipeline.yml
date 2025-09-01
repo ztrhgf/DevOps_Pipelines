@@ -162,23 +162,28 @@ jobs:
             git config --global core.autocrlf false
 
             #region MAIN BACKUP LOGIC
-            Write-Host "`nExporting Devices data"
+            Write-Host "`nGetting devices data"
 
             $mainProperty = 'SerialNumber', 'DeviceName', 'Id', 'AzureAdDeviceId', 'UserPrincipalName', 'OperatingSystem', 'OSVersion', 'ManagementAgent'
 
             #region get devices basic data
-            #TIP EnrolledDateTime from Intune shows incorrect date, get the Azure RegistrationDateTime instead
-            $deviceRegistration = New-GraphBatchRequest -url "/devices?`$select=DeviceId, RegistrationDateTime" | Invoke-GraphBatchRequest
-            # get all Windows and MacOs managed devices
-            $devices = New-GraphBatchRequest -url "/deviceManagement/managedDevices?`$filter=ManagementAgent eq 'mdm'&`$select=$($mainProperty -join ',')" | Invoke-GraphBatchRequest | ? { $_.OperatingSystem -in 'macOS', 'Windows' } | select $mainProperty | select *, @{n = 'EnrolledDateTime'; e = { $deviceId = $_.AzureAdDeviceId ; ($deviceRegistration | ? DeviceId -EQ $deviceId).RegistrationDateTime } }
+            # get all Entra devices
+            $entraDevice = New-GraphBatchRequest -url "/devices?`$select=DeviceId, Id, RegistrationDateTime" | Invoke-GraphBatchRequest
+            # get all Windows and MacOs Intune managed devices
+            #TIP EnrolledDateTime from Intune might show incorrect date (because reused object), use the Azure RegistrationDateTime instead
+            $devices = New-GraphBatchRequest -url "/deviceManagement/managedDevices?`$filter=ManagementAgent eq 'mdm'&`$select=$($mainProperty -join ',')" | Invoke-GraphBatchRequest | ? { $_.OperatingSystem -in 'macOS', 'Windows' } | select $mainProperty | select *, @{n = 'EnrolledDateTime'; e = { $deviceId = $_.AzureAdDeviceId ; ($entraDevice | ? DeviceId -EQ $deviceId).RegistrationDateTime } }
+
+            if (!$devices) {
+                throw "No devices found for backup!"
+            }
 
             #region get rid of device duplicity records (OS reinstalls etc)
-            $staleDeviceId = @()
+            [System.Collections.Generic.List[object]] $staleDeviceId = @()
             $devices | group SerialNumber | ? Count -GT 1 | % {
                 $duplicityRecord = $_.group | sort EnrolledDateTime -Descending
                 $newestRecord = $duplicityRecord | select -First 1
                 $duplicityRecord | ? Id -NE $newestRecord.Id | % {
-                    $staleDeviceId += $_.Id
+                    $staleDeviceId.Add($_.Id)
                 }
             }
 
@@ -187,6 +192,18 @@ jobs:
 
             $windowsClient = $devices | ? OperatingSystem -EQ 'Windows'
             $macOSClient = $devices | ? OperatingSystem -EQ 'macOS'
+
+            #region get rid of devices without Entra record (not yet enrolled device etc)
+            # such devices won't have LAPS or Bitlocker keys saved anyway
+            $windowsClient = $windowsClient | % {
+                if ($_.azureADDeviceId -in $entraDevice.DeviceId) {
+                    # device is in the Entra
+                    $_
+                } else {
+                    Write-Warning "Skipping $($_.DeviceName) ($($_.Id)). No record in the Entra found!"
+                }
+            }
+            #endregion get rid of devices without Entra record (not yet enrolled device etc)
             #endregion get devices basic data
 
             #region helper function for comparing and reusing encrypted values
@@ -233,16 +250,18 @@ jobs:
 
             #region get device to-backup-data
             # get laps passwords for all windows devices (if enabled)
-            $lapsList = @()
+            $lapsList = $null
             if ($includeLAPS -and $windowsClient) {
+                Write-Host " - Getting LAPS data"
                 $lapsList = New-GraphBatchRequest -url "/directory/deviceLocalCredentials/<placeholder>?`$select=credentials" -placeholder $windowsClient.AzureAdDeviceId | Invoke-GraphBatchRequest -graphVersion beta
             }
 
             # get bitlocker keys for all windows devices (if enabled)
-            $bitlockerKeyList = @()
-            $bitlockerKeyValueList = @()
+            $bitlockerKeyList = $null
+            $bitlockerKeyValueList = $null
 
             if ($includeBitLocker -and $windowsClient) {
+                Write-Host " - Getting Bitlocker data"
                 $bitlockerKeyList = New-GraphBatchRequest -url "/informationProtection/bitlocker/recoveryKeys" | Invoke-GraphBatchRequest -graphVersion beta | ? deviceId -In $windowsClient.AzureAdDeviceId
                 # get actual bitlocker key values
                 if ($bitlockerKeyList) {
@@ -251,21 +270,25 @@ jobs:
             }
 
             # get FileVault keys for all MacOs devices (if enabled)
-            $fileVaultKeyList = @()
+            $fileVaultKeyList = $null
 
             if ($includeFileVault -and $macOSClient) {
+                Write-Host "- Getting FileVault data"
                 # TIP if device doesn't yet have the fileVault key saved in the Intune, the request fails with the 404
                 # TIP 'ErrorAction = SilentlyContinue' because of this pipeline setting failOnStderr: true (which is needed to know backup isn't working)
                 $fileVaultKeyList = New-GraphBatchRequest -url "/deviceManagement/managedDevices('<placeholder>')/getFileVaultKey" -placeholderAsId -placeholder $macOSClient.Id | Invoke-GraphBatchRequest -graphVersion beta -ErrorVariable fileVaultError -ErrorAction SilentlyContinue
 
-                if ($fileVaultError -notlike "*StatusCode: '404'*") {
-                    throw $fileVaultError
-                } else {
-                    Write-Warning "MacOs device without FileVault key stored in the Intune: $(($fileVaultKeyList | ? {!($_.Value)}).RequestId -join ', ')"
+                if ($fileVaultError) {
+                    if ($fileVaultError -notmatch "StatusCode: '?404'?") {
+                        throw $fileVaultError
+                    } else {
+                        Write-Warning "MacOs device without FileVault key stored in the Intune: $(($macOSClient | ? Id -notin $fileVaultKeyList.RequestId).DeviceName -join ', ')"
+                    }
                 }
             }
 
             # create finalized device objects with all required properties
+            Write-Host "`n Generating device data"
             $result = foreach ($device in $devices) {
                 $deviceOS = $device.OperatingSystem
                 $enrolledDateTime = $device.EnrolledDateTime
@@ -273,7 +296,7 @@ jobs:
                 $existingDevice = $existingDeviceData[$serialNumber]
                 $hasChanges = $false
 
-                Write-Warning "Processing $($device.DeviceName) ($serialNumber)"
+                Write-Host "- $($device.DeviceName) ($serialNumber)"
 
                 switch ($deviceOS) {
                     'Windows' {
@@ -288,7 +311,7 @@ jobs:
                             $bitLockerKeyObjects = $bitlockerKeyValueList | ? Id -In $bitLockerKeyId | sort id
 
                             # Compare BitLocker keys by ID to detect changes
-                            $existingBitLockerIds = @()
+                            $existingBitLockerIds = $null
                             if ($existingDevice -and $existingDevice.Bitlocker) {
                                 $existingBitLockerIds = $existingDevice.Bitlocker | Select-Object -ExpandProperty id
                             }
@@ -514,32 +537,27 @@ jobs:
                 }
             }
 
-            # Verify we have the expected data
-            if (!$devices) {
-                throw "No devices found for backup!"
-            }
-
             # Verify enabled backup options have data where expected
-            $verificationErrors = @()
+            [System.Collections.Generic.List[object]] $verificationErrors = @()
 
             if ($includeBitLocker -and $windowsClient) {
                 $bitLockerDevicesWithData = ($result.DeviceData | Where-Object { $_.OperatingSystem -eq 'Windows' -and $_.Bitlocker })
                 if (!$bitLockerDevicesWithData) {
-                    $verificationErrors += "BitLocker backup is enabled but no Windows devices have BitLocker data"
+                    $verificationErrors.Add("BitLocker backup is enabled but no Windows devices have BitLocker data")
                 }
             }
 
             if ($includeLAPS -and $windowsClient) {
                 $lapsDevicesWithData = ($result.DeviceData | Where-Object { $_.OperatingSystem -eq 'Windows' -and $_.LAPS })
                 if (!$lapsDevicesWithData) {
-                    $verificationErrors += "LAPS backup is enabled but no Windows devices have LAPS data"
+                    $verificationErrors.Add("LAPS backup is enabled but no Windows devices have LAPS data")
                 }
             }
 
             if ($includeFileVault -and $macOSClient) {
                 $fileVaultDevicesWithData = ($result.DeviceData | Where-Object { $_.OperatingSystem -eq 'macOS' -and $_.FileVault })
                 if (!$fileVaultDevicesWithData) {
-                    $verificationErrors += "FileVault backup is enabled but no macOS devices have FileVault data"
+                    $verificationErrors.Add("FileVault backup is enabled but no macOS devices have FileVault data")
                 }
             }
 
@@ -554,6 +572,8 @@ jobs:
             $totalDevices = 0
 
             # export data to JSON files only if changes detected
+            Write-Host "`nExporting device data to JSON files"
+
             foreach ($deviceResult in $result) {
                 $deviceData = $deviceResult.DeviceData
                 $hasChanges = $deviceResult.HasChanges
@@ -578,13 +598,13 @@ jobs:
 
                 if ($hasChanges) {
                     $changedDevices++
-                    Write-Host "Changes detected for device $($deviceData.DeviceName) ($serialNumber) - updating JSON file"
+                    Write-Host "- Changes detected for device $($deviceData.DeviceName) ($serialNumber)"
 
                     # Add encryption status to the device data
                     $deviceDataWithMeta = $deviceData | Select-Object *, @{n = 'encryptionEnabled'; e = { $encryptionEnabled } }
                     $deviceDataWithMeta | ConvertTo-Json -Depth 10 | Out-File -FilePath $jsonPath -Encoding utf8 -Force
                 } else {
-                    Write-Host "No changes detected for device $($deviceData.DeviceName) ($serialNumber) - skipping JSON update"
+                    Write-Host "- No changes detected for device $($deviceData.DeviceName) ($serialNumber)"
 
                     # Ensure the file exists even if no changes (in case it was deleted)
                     if (-not (Test-Path $jsonPath)) {
@@ -596,7 +616,7 @@ jobs:
                 }
             }
 
-            Write-Host "Processing complete: $changedDevices of $totalDevices devices had changes"
+            Write-Host "`nProcessing complete: $changedDevices of $totalDevices devices had changes"
 
             # Set variable to indicate if any changes were made
             if ($changedDevices -gt 0) {
