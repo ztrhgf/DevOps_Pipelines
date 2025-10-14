@@ -10,7 +10,11 @@ variables:
   - name: BACKUP_FOLDER
     value: prod-backup
   - name: PIPELINE_TIME_LIMIT
-    value: "60" # 60 is default for free Pipeline, 0 for unlimited run time
+    value: "60" # 60 minutes is default for free Pipeline, 0 for unlimited run time
+  - name: MAXIMUM_LOG_SEARCH_LIMIT
+    value: "30" # maximum number of days, search for audit events can go
+  - name: SKIP_CHANGE_AUTHOR_SEARCH
+    value: "0" # 1 to skip searching for change author to speed up the pipeline (useful in case backup run time exceeds PIPELINE_TIME_LIMIT minutes limit)
   - name: SERVICE_CONNECTION_NAME
     value: azure_backup_connection
   - name: USER_EMAIL
@@ -29,34 +33,37 @@ jobs:
         persistCredentials: true
 
       - task: AzurePowerShell@5
-        displayName: "Get Graph Token for Workload Federated Credential"
+        displayName: Export backup & commit
+        name: commitAndSetVariable
         inputs:
           azureSubscription: $(SERVICE_CONNECTION_NAME)
           azurePowerShellVersion: "LatestVersion"
           ScriptType: "inlineScript"
           Inline: |
-            $accessToken = ([PSCredential]::New('dummy', (Get-AzAccessToken -ResourceTypeName MSGraph -AsSecureString -ErrorAction Stop ).Token).GetNetworkCredential().Password)
-            Write-Host "##vso[task.setvariable variable=accessToken;issecret=true]$accessToken"
-      - task: PowerShell@2
-        displayName: Export backup & commit
-        name: commitAndSetVariable
-        inputs:
-          targetType: "inline"
-          script: |
             $root = "$(Build.SourcesDirectory)"
 
             Set-Location $root
 
-            # $verbosePreference = 'continue'
+            #$verbosePreference = 'continue'
 
             Write-Host 'Installing EntraExporter module'
-            Install-Module -Name EntraExporter -AllowClobber -Force -AcceptLicense
 
-            #region authenticate to Graph API using service principal secret
+            $graphModuleVersion = "2.8.0" # works well with pipeline Az module version
+            Install-Module Microsoft.Graph.Authentication -AllowClobber -Force -AcceptLicense -RequiredVersion $graphModuleVersion
+            Install-Module -Name EntraExporterFast -AllowClobber -Force -AcceptLicense
+
+            #region authenticate to Graph API
             Write-Host "Authenticating to Graph API"
-            $secureToken = ConvertTo-SecureString -String $(accessToken) -AsPlainText -Force
-            Connect-MgGraph -AccessToken $secureToken
-            #endregion authenticate to Graph API using service principal secret
+            $accessToken = (Get-AzAccessToken -ResourceTypeName MSGraph -AsSecureString -ErrorAction Stop).Token
+            Connect-MgGraph -AccessToken $accessToken
+            #endregion authenticate to Graph API
+
+            # enable long paths in Windows
+            if ((Get-ItemPropertyValue HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem -Name LongPathsEnabled -ErrorAction SilentlyContinue) -ne 1) {
+              # IAM backup can create files with path longer than 260 characters
+              Write-Host 'Enabling LongPathsEnabled in the registry'
+              Set-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem -Name LongPathsEnabled -Type DWord -Value 1
+            }
 
             # configure GIT defaults
             git config --global user.name 'unknown'
@@ -88,7 +95,7 @@ jobs:
 
               # install required Graph module (for getting audit logs)
               Write-Host 'Installing Microsoft.Graph.Reports module'
-              Install-Module Microsoft.Graph.Reports -AllowClobber -Force -AcceptLicense -RequiredVersion 2.8.0 # 2.10.0 is buggy (Get-MgAuditLogDirectoryAudit : One or more errors occurred.)
+              Install-Module Microsoft.Graph.Reports -AllowClobber -Force -AcceptLicense -RequiredVersion $graphModuleVersion
 
               #region helper functions
               # to be able to catch errors and all outputs
@@ -139,13 +146,15 @@ jobs:
                   return $true
                 }
 
-                $insurance = 2
+                # how many minutes I need to finish the pipeline (commit changes etc)
+                $insurance = 10
                 $remainingFile = @($changedFile).count - $processedFile
-                $runMinute = ([datetime]::Now - $backupStart).TotalMinutes
+                $alreadyRunMinutes = ([datetime]::Now - $backupStart).TotalMinutes
                 # I hope 0.2 second is enough for one change processing
                 # TIP: make it higher if it is not
-                $remainingMinute = ($remainingFile * 0.2)/60
-                if (($runMinute + $remainingMinute + $insurance) -lt $(PIPELINE_TIME_LIMIT)) {
+                $remainingToProcessMinutes = ($remainingFile * 0.2)/60
+                write-debug "alreadyRunMinutes: $alreadyRunMinutes remainingToProcessMinutes: $remainingToProcessMinutes remainingFile: $remainingFile changedFile: $(@($changedFile).count) processedFile: $processedFile"
+                if (($alreadyRunMinutes + $remainingToProcessMinutes + $insurance) -lt $(PIPELINE_TIME_LIMIT)) {
                   return $true
                 } else {
                   return $false
@@ -184,39 +193,62 @@ jobs:
               $modificationData = New-Object System.Collections.ArrayList
 
               #region get all Azure audit events since the last commit
-              # it is much faster to get all events at once then retrieve them one by one using resourceId
-              #region create search filter
-              $filter = @("Result eq 'success'")
+              if (!$(SKIP_CHANGE_AUTHOR_SEARCH)) {
+                # it is much faster to get all events at once then retrieve them one by one using resourceId
+                #region create search filter
+                $filter = @("Result eq 'success'")
 
-              if ($lastCommitDate) {
-                # Azure logs use UTC time
-                $lastCommitDate = $lastCommitDate.ToUniversalTime()
-                $filterDateTimeFrom = Get-Date -Date $lastCommitDate -Format "yyyy-MM-ddTHH:mm:ss"
-                $filter += "ActivityDateTime ge $filterDateTimeFrom`Z"
+                if ($lastCommitDate) {
+                  if ($(MAXIMUM_LOG_SEARCH_LIMIT) -and ((Get-Date).AddDays(-$(MAXIMUM_LOG_SEARCH_LIMIT)) -gt $lastCommitDate)) {
+                    $thresholdDate = (Get-Date).AddDays(-$(MAXIMUM_LOG_SEARCH_LIMIT))
+                    Write-Warning "Replacing '$lastCommitDate' as an event log search start date for '$thresholdDate'"
+                    $lastCommitDate = $thresholdDate
+                  }
+                  # Azure logs use UTC time
+                  $lastCommitDate = $lastCommitDate.ToUniversalTime()
+                  $filterDateTimeFrom = Get-Date -Date $lastCommitDate -Format "yyyy-MM-ddTHH:mm:ss"
+                  $filter += "ActivityDateTime ge $filterDateTimeFrom`Z"
+                }
+
+                $backupStart = $backupStart.ToUniversalTime()
+                $filterDateTimeTo = Get-Date -Date $backupStart -Format "yyyy-MM-ddTHH:mm:ss"
+                $filter += "ActivityDateTime le $filterDateTimeTo`Z"
+
+                $eventFilter = $filter -join " and "
+                #endregion create search filter
+
+                Write-Host "`n$(Get-Date -format 'HH:mm') (UTC) Getting Azure Audit events"
+                Write-Host "`t- from: '$lastCommitDate' (UTC) to: '$backupStart' (UTC)"
+                Write-Host "`t- filter: $eventFilter"
+                $modificationEvent = Get-MgAuditLogDirectoryAudit -All -Filter $eventFilter
+                # omit events not related to making changes
+                $modificationEvent = $modificationEvent.Where({$_.OperationType})
+                Write-Host "`t- found $($modificationEvent.count) events"
               }
-
-              $backupStart = $backupStart.ToUniversalTime()
-              $filterDateTimeTo = Get-Date -Date $backupStart -Format "yyyy-MM-ddTHH:mm:ss"
-              $filter += "ActivityDateTime le $filterDateTimeTo`Z"
-
-              $eventFilter = $filter -join " and "
-              #endregion create search filter
-
-              Write-Host "`n$(Get-Date -format 'HH:mm') (UTC) Getting Azure Audit events"
-              Write-Host "`t- from: '$lastCommitDate' (UTC) to: '$backupStart' (UTC)"
-              Write-Host "`t- filter: $eventFilter"
-              $modificationEvent = Get-MgAuditLogDirectoryAudit -All -Filter $eventFilter
-              # omit events not related to making changes
-              $modificationEvent = $modificationEvent.Where({$_.OperationType})
-              Write-Host "`t- found $($modificationEvent.count) events"
               #endregion get all Azure audit events since the last commit
 
               Write-Host "`n$(Get-Date -format 'HH:mm') (UTC) Processing changed files ($($changedFile.count))"
               $processedFile = 0
-              $skippedSearching = 0
+              $notEnoughTime = 0
+              if ($(SKIP_CHANGE_AUTHOR_SEARCH)) {
+                Write-Warning "Skipping search for change author, because of SKIP_CHANGE_AUTHOR_SEARCH pipeline variable"
+                $notEnoughTime = 1
+              }
               # try to find out who made the change
               foreach ($file in $changedFile) {
+                if ($notEnoughTime) {
+                    $null = $modificationData.Add(
+                        [PSCustomObject]@{
+                            file                  = Join-Path $root $file
+                            modificationAuthorUPN = 'unknown@unknown.com'
+                        }
+                    )
+
+                    continue
+                }
+
                 ++$processedFile
+
                 # resource ID is same as a file name
                 $resourceId = [System.IO.Path]::GetFileNameWithoutExtension($file)
                 Write-Verbose "`t- $resourceId ($file)"
@@ -250,7 +282,8 @@ jobs:
                     $modificationAuthorUPN = $modificationAuthorUPN | select -Unique | Sort-Object
                   } else {
                     # give up searching for change author because of pipeline run 60 minutes limit
-                    ++$skippedSearching
+                    ++$notEnoughTime
+                    Write-Warning "Skipped searching for change author in $($changedFile.count - $processedFile) cases, because there is not enough time left to process whole pipeline (maximum pipeline runtime is $(PIPELINE_TIME_LIMIT) minutes)"
                     $modificationAuthorUPN = $null
                   }
 
@@ -266,15 +299,10 @@ jobs:
 
                 $null = $modificationData.Add(
                   [PSCustomObject]@{
-                      resourceId            = $resourceId
                       file                  = Join-Path $root $file
                       modificationAuthorUPN = $modificationAuthorUPN
                   }
                 )
-              }
-
-              if ($skippedSearching) {
-                Write-Warning "Skipped searching for change author in $skippedSearching cases (because of the $(PIPELINE_TIME_LIMIT) minutes pipeline run limit)"
               }
 
               #region commit changes by author(s) who made them
@@ -285,11 +313,19 @@ jobs:
                 $modificationAuthorName = $modificationAuthorUPN | % { $_.split('@')[0] }
                 $modifiedFile = $_.Group.File
 
-                $modifiedFile | % {
-                  Write-Verbose "`t- Adding $_"
-                  $gitResult = _startProcess git -ArgumentList "add `"$_`"" -dontWait -outputErr2Std
-                  if ($gitResult -match "^fatal:") {
-                    throw $gitResult
+                if ($modifiedFile.count -eq $changedFile.count) {
+                    Write-Verbose "`t- Adding all files"
+                    $gitResult = _startProcess git -ArgumentList "add ." -dontWait -outputErr2Std
+                    if ($gitResult -match "^fatal:") {
+                      throw $gitResult
+                    }
+                } else {
+                  $modifiedFile | % {
+                    Write-Verbose "`t- Adding $_"
+                    $gitResult = _startProcess git -ArgumentList "add `"$_`"" -dontWait -outputErr2Std
+                    if ($gitResult -match "^fatal:") {
+                      throw $gitResult
+                    }
                   }
                 }
 
