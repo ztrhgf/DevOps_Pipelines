@@ -50,7 +50,7 @@ jobs:
 
             $graphModuleVersion = "2.8.0" # works well with pipeline Az module version
             Install-Module Microsoft.Graph.Authentication -AllowClobber -Force -AcceptLicense -RequiredVersion $graphModuleVersion
-            Install-Module -Name EntraExporterFast -AllowClobber -Force -AcceptLicense
+            Install-Module -Name EntraExporter -AllowClobber -Force -AcceptLicense
 
             #region authenticate to Graph API
             Write-Host "Authenticating to Graph API"
