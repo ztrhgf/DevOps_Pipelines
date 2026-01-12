@@ -48,8 +48,7 @@ jobs:
 
             Write-Host 'Installing EntraExporter module'
 
-            $graphModuleVersion = "2.8.0" # works well with pipeline Az module version
-            Install-Module Microsoft.Graph.Authentication -AllowClobber -Force -AcceptLicense -RequiredVersion $graphModuleVersion
+            Install-Module Microsoft.Graph.Authentication -AllowClobber -Force -AcceptLicense
             Install-Module -Name EntraExporter -AllowClobber -Force -AcceptLicense
 
             #region authenticate to Graph API
@@ -365,7 +364,7 @@ jobs:
               echo "##vso[task.setVariable variable=CHANGE_DETECTED;isOutput=true;]0"
             }
           failOnStderr: true
-          pwsh: false
+          pwsh: true
 
   - job: tag
     displayName: Tag repo
