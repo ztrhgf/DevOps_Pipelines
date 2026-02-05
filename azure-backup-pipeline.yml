@@ -26,7 +26,7 @@ jobs:
   - job: backup_azure
     displayName: Backup & commit Azure configuration
     pool:
-      vmImage: windows-latest
+      vmImage: ubuntu-latest
     continueOnError: false
     steps:
       - checkout: self
@@ -46,10 +46,12 @@ jobs:
 
             #$verbosePreference = 'continue'
 
-            Write-Host 'Installing EntraExporter module'
-
+            #region install modules
             Install-Module Microsoft.Graph.Authentication -AllowClobber -Force -AcceptLicense
-            Install-Module -Name EntraExporter -AllowClobber -Force -AcceptLicense
+            $moduleName = 'EntraExporterFast'
+            Write-Host "Installing $moduleName module"
+            Install-Module -Name $moduleName -AllowClobber -Force -AcceptLicense -AllowPrerelease
+            #endregion install modules
 
             #region authenticate to Graph API
             Write-Host "Authenticating to Graph API"
@@ -58,7 +60,7 @@ jobs:
             #endregion authenticate to Graph API
 
             # enable long paths in Windows
-            if ((Get-ItemPropertyValue HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem -Name LongPathsEnabled -ErrorAction SilentlyContinue) -ne 1) {
+            if ($env:OS -eq "Windows_NT" -and (Get-ItemPropertyValue HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem -Name LongPathsEnabled -ErrorAction SilentlyContinue) -ne 1) {
               # IAM backup can create files with path longer than 260 characters
               Write-Host 'Enabling LongPathsEnabled in the registry'
               Set-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem -Name LongPathsEnabled -Type DWord -Value 1
@@ -94,7 +96,7 @@ jobs:
 
               # install required Graph module (for getting audit logs)
               Write-Host 'Installing Microsoft.Graph.Reports module'
-              Install-Module Microsoft.Graph.Reports -AllowClobber -Force -AcceptLicense -RequiredVersion $graphModuleVersion
+              Install-Module Microsoft.Graph.Reports -AllowClobber -Force -AcceptLicense
 
               #region helper functions
               # to be able to catch errors and all outputs
