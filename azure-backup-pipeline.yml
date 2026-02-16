@@ -47,7 +47,10 @@ jobs:
             #$verbosePreference = 'continue'
 
             #region install modules
-            Install-Module Microsoft.Graph.Authentication -AllowClobber -Force -AcceptLicense
+            # explicit import to avoid later DLL conflicts
+            Import-Module Microsoft.Graph.Authentication
+            Import-Module Microsoft.Graph.Reports
+
             $moduleName = 'EntraExporterFast'
             Write-Host "Installing $moduleName module"
             Install-Module -Name $moduleName -AllowClobber -Force -AcceptLicense -AllowPrerelease
@@ -93,10 +96,6 @@ jobs:
             if ($changedFile) {
               # set CHANGE_DETECTED pipeline variable
               echo "##vso[task.setVariable variable=CHANGE_DETECTED;isOutput=true;]1"
-
-              # install required Graph module (for getting audit logs)
-              Write-Host 'Installing Microsoft.Graph.Reports module'
-              Install-Module Microsoft.Graph.Reports -AllowClobber -Force -AcceptLicense
 
               #region helper functions
               # to be able to catch errors and all outputs
