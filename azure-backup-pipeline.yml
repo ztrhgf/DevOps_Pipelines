@@ -48,12 +48,15 @@ jobs:
 
             #region install modules
             # explicit import to avoid later DLL conflicts
+            Install-Module Microsoft.Graph.Authentication -RequiredVersion 2.36.0 -Force
+            Install-Module Microsoft.Graph.Reports -RequiredVersion 2.36.0 -Force
             Import-Module Microsoft.Graph.Authentication
             Import-Module Microsoft.Graph.Reports
 
             $moduleName = 'EntraExporterFast'
             Write-Host "Installing $moduleName module"
             Install-Module -Name $moduleName -AllowClobber -Force -AcceptLicense -AllowPrerelease
+            Import-Module $moduleName
             #endregion install modules
 
             #region authenticate to Graph API
